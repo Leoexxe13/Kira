@@ -740,6 +740,185 @@ class HudCanvas(QWidget):
 
         p.end()   # end deterministically so the backing store never flushes an active painter
 
+
+# === KIRA_CORE_ORB_V3 ===
+class KiraCoreV2(HudCanvas):
+    def paintEvent(self, _):
+        p = QPainter(self)
+        if not p.isActive():
+            return
+
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.fillRect(self.rect(), qcol(C.BG))
+
+        W, H = self.width(), self.height()
+        cx, cy = W / 2.0, H / 2.0
+        base = min(W, H)
+        R = base * 0.29
+
+        # Technical grid.
+        p.setPen(QPen(qcol(C.BORDER, 50), 1))
+        step = max(38, int(base * 0.09))
+        for x in range(0, W, step):
+            p.drawLine(x, 0, x, H)
+        for y in range(0, H, step):
+            p.drawLine(0, y, W, y)
+
+        # Crosshair.
+        p.setPen(QPen(qcol(C.PRI, 45), 1))
+        p.drawLine(QPointF(cx, cy - R * 1.55), QPointF(cx, cy + R * 1.55))
+        p.drawLine(QPointF(cx - R * 1.55, cy), QPointF(cx + R * 1.55, cy))
+
+        amp = max(0.0, min(1.0, getattr(self, "_amp_disp", 0.0)))
+        pulse = 1.0 + amp * 0.10 + math.sin(self._tick * 0.035) * 0.012
+
+        # Outer soft halo.
+        for i in range(4):
+            rr = R * (1.02 + i * 0.075) * pulse
+            p.setPen(QPen(qcol(C.PRI, max(8, 30 - i * 6)), 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QRectF(cx - rr, cy - rr, rr * 2, rr * 2))
+
+        # Thin concentric rings.
+        for frac, alpha, width in (
+            (0.58, 95, 1.0),
+            (0.74, 135, 1.0),
+            (0.90, 175, 1.2),
+            (1.08, 110, 1.0),
+        ):
+            rr = R * frac
+            p.setPen(QPen(qcol(C.PRI, alpha), width))
+            p.drawEllipse(QRectF(cx - rr, cy - rr, rr * 2, rr * 2))
+
+        # Moving segmented arcs.
+        rings = getattr(self, "_rings", [0.0, 120.0, 240.0])
+        for frac, phase, span, gap, width in (
+            (0.72, rings[0], 42, 32, 1.8),
+            (0.90, rings[1], 28, 24, 1.3),
+            (1.08, rings[2], 18, 18, 1.0),
+        ):
+            rr = R * frac
+            rect = QRectF(cx - rr, cy - rr, rr * 2, rr * 2)
+            p.setPen(QPen(qcol(C.PRI, 205), width))
+            a = phase
+            while a < phase + 360:
+                p.drawArc(rect, int(a * 16), int(span * 16))
+                a += span + gap
+
+        # Rotating radar sweep.
+        scan = getattr(self, "_scan", 0.0)
+        rr = R * 1.18
+        rect = QRectF(cx - rr, cy - rr, rr * 2, rr * 2)
+        p.setPen(QPen(qcol(C.ACC2, 125), 2.0))
+        p.drawArc(rect, int(scan * 16), int(24 * 16))
+
+        # Outer ticks.
+        p.setPen(QPen(qcol(C.TEXT_MED, 130), 1))
+        for deg in range(0, 360, 6):
+            rad = math.radians(deg)
+            outer = R * 1.22
+            inner = R * (1.15 if deg % 30 == 0 else 1.19)
+            p.drawLine(
+                QPointF(cx + math.cos(rad) * inner, cy + math.sin(rad) * inner),
+                QPointF(cx + math.cos(rad) * outer, cy + math.sin(rad) * outer),
+            )
+
+        # Orbiting light nodes.
+        for i in range(12):
+            speed = 0.20 + (i % 4) * 0.03
+            ang = math.radians((self._tick * speed + i * 30) % 360)
+            orbit = R * (0.74 + (i % 3) * 0.13)
+            x = cx + math.cos(ang) * orbit
+            y = cy + math.sin(ang) * orbit
+            pr = 1.7 if i % 4 else 3.0
+            p.setPen(Qt.PenStyle.NoPen)
+            p.setBrush(qcol(C.PRI, 200 if i % 4 else 255))
+            p.drawEllipse(QRectF(x - pr, y - pr, pr * 2, pr * 2))
+
+        # Futuristic living orb.
+        orb_r = R * 0.30 * pulse
+        phase = math.radians((self._tick * 0.9) % 360)
+
+        # Orb glow shells.
+        for i in range(5):
+            rr = orb_r * (1.05 + i * 0.11)
+            p.setPen(QPen(qcol(C.PRI, max(10, 58 - i * 10)), 1))
+            p.setBrush(Qt.BrushStyle.NoBrush)
+            p.drawEllipse(QRectF(cx - rr, cy - rr, rr * 2, rr * 2))
+
+        # Orb body.
+        p.setPen(QPen(qcol(C.WHITE, 225), 1.3))
+        p.setBrush(qcol(C.PANEL2, 245))
+        p.drawEllipse(QRectF(cx - orb_r, cy - orb_r, orb_r * 2, orb_r * 2))
+
+        # Rotating wireframe longitude curves.
+        p.setPen(QPen(qcol(C.PRI, 120), 1))
+        for i in range(7):
+            offset = (i - 3) / 3.0
+            squeeze = max(0.14, abs(math.cos(phase + offset * 0.7)))
+            shift = math.sin(phase + offset * 0.8) * orb_r * 0.10
+            w = orb_r * 2 * squeeze
+            p.drawEllipse(QRectF(
+                cx - w / 2 + shift,
+                cy - orb_r,
+                w,
+                orb_r * 2
+            ))
+
+        # Rotating latitude curves.
+        for i in range(5):
+            offset = (i - 2) / 2.0
+            squeeze = max(0.16, abs(math.sin(phase * 0.8 + offset * 0.7)))
+            shift = math.cos(phase + offset) * orb_r * 0.08
+            h = orb_r * 2 * squeeze
+            p.drawEllipse(QRectF(
+                cx - orb_r,
+                cy - h / 2 + shift,
+                orb_r * 2,
+                h
+            ))
+
+        # Dynamic internal arcs for motion.
+        p.setPen(QPen(qcol(C.WHITE, 160), 1.2))
+        inner_rect = QRectF(
+            cx - orb_r * 0.82,
+            cy - orb_r * 0.82,
+            orb_r * 1.64,
+            orb_r * 1.64
+        )
+        p.drawArc(inner_rect, int((self._tick * 1.6) % 360 * 16), int(110 * 16))
+        p.drawArc(inner_rect, int((-self._tick * 1.1) % 360 * 16), int(80 * 16))
+
+        # Bright breathing center.
+        dot_r = 3.5 + amp * 5.0 + (math.sin(self._tick * 0.08) + 1.0) * 0.8
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(qcol(C.PRI, 255))
+        p.drawEllipse(QRectF(cx - dot_r, cy - dot_r, dot_r * 2, dot_r * 2))
+
+        # State under orb; no static KIRA name inside.
+        state_txt = str(getattr(self, "state", "READY")).upper()
+        p.setPen(qcol(C.TEXT_MED, 220))
+        p.setFont(QFont("Courier New", max(7, int(base * 0.011)), QFont.Weight.Bold))
+        p.drawText(
+            QRectF(cx - R, cy + R * 1.38, R * 2, 20),
+            int(Qt.AlignmentFlag.AlignCenter),
+            state_txt
+        )
+
+        # Reactive waveform.
+        wave_y = cy + R * 1.57
+        wave_w = R * 1.30
+        p.setPen(QPen(qcol(C.PRI, 120), 1))
+        for i in range(34):
+            rel = i / 33.0
+            x = cx - wave_w / 2 + rel * wave_w
+            wobble = math.sin(self._tick * 0.15 + i * 0.75)
+            h = 3 + (7 + amp * 18) * abs(wobble)
+            p.drawLine(QPointF(x, wave_y - h / 2), QPointF(x, wave_y + h / 2))
+
+        p.end()
+
+
 class MetricBar(QWidget):
 
     def __init__(self, label: str, color: str = C.PRI, parent=None):
@@ -2796,44 +2975,37 @@ class MainWindow(QMainWindow):
         root.setSpacing(0)
         root.addWidget(self._build_header())
 
-        body = QHBoxLayout()
-        body.setContentsMargins(0, 0, 0, 0)
-        body.setSpacing(0)
-
+        # === KIRA_REAL_PAGES_V1 ===
+        # Build original functional widgets first; then place them on distinct pages.
         self._left_panel = self._build_left_panel()
-        body.addWidget(self._left_panel, stretch=0)
+        self._left_panel.setMinimumWidth(230)
+        self._left_panel.setMaximumWidth(310)
 
-        # Center column: HUD + resizable content panel via QSplitter
-        self.hud = HudCanvas(face_path, _display)
+        # KIRA core + content/news/briefing panel.
+        self.hud = KiraCoreV2(face_path, _display)
         self.hud.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._content_panel = self._build_content_panel()
 
-        # Live camera container — replaces HUD when camera stream is active
+        # Live camera container — keeps original camera behavior.
         _cam_cont = QWidget()
-        _cam_cont.setStyleSheet("background: #000308;")
+        _cam_cont.setStyleSheet("background: #020304;")
         _cam_v = QVBoxLayout(_cam_cont)
         _cam_v.setContentsMargins(0, 0, 0, 0)
         _cam_v.setSpacing(0)
         _cam_hdr = QHBoxLayout()
-        _cam_hdr.setContentsMargins(8, 5, 8, 5)
-        _cam_title = QLabel("◈  CAMERA FEED")
+        _cam_hdr.setContentsMargins(10, 7, 10, 7)
+        _cam_title = QLabel("CAMERA // LIVE")
         _cam_title.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
         _cam_title.setStyleSheet(f"color: {C.PRI}; background: transparent;")
         _cam_hdr.addWidget(_cam_title)
         _cam_hdr.addStretch()
-        _cam_x = QPushButton("✕  CLOSE")
+        _cam_x = QPushButton("CLOSE")
         _cam_x.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
         _cam_x.setCursor(Qt.CursorShape.PointingHandCursor)
-        _cam_x.setStyleSheet(f"""
-            QPushButton {{
-                color: {C.TEXT_DIM}; background: transparent;
-                border: none; padding: 2px 6px;
-            }}
-            QPushButton:hover {{ color: {C.PRI}; }}
-        """)
         _cam_x.clicked.connect(self.stop_camera_stream)
         _cam_hdr.addWidget(_cam_x)
         _cam_v.addLayout(_cam_hdr)
+
         self._cam_live_lbl = QLabel()
         self._cam_live_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._cam_live_lbl.setStyleSheet("background: transparent;")
@@ -2842,32 +3014,76 @@ class MainWindow(QMainWindow):
         )
         _cam_v.addWidget(self._cam_live_lbl, stretch=1)
 
-        # Stack: 0 = animated HUD, 1 = live camera
         self._hud_cam_stack = QStackedWidget()
         self._hud_cam_stack.addWidget(self.hud)
         self._hud_cam_stack.addWidget(_cam_cont)
 
         self._center_split = QSplitter(Qt.Orientation.Vertical)
-        self._center_split.setStyleSheet(f"""
-            QSplitter::handle {{
-                background: {C.BORDER};
-                height: 4px;
-            }}
-            QSplitter::handle:hover {{
-                background: {C.PRI_DIM};
-            }}
-        """)
+        self._center_split.setStyleSheet(
+            f"QSplitter::handle {{ background:{C.BORDER}; height:4px; }}"
+            f"QSplitter::handle:hover {{ background:{C.PRI_DIM}; }}"
+        )
         self._center_split.addWidget(self._hud_cam_stack)
         self._center_split.addWidget(self._content_panel)
         self._center_split.setStretchFactor(0, 3)
-        self._center_split.setStretchFactor(1, 1)
+        self._center_split.setStretchFactor(1, 2)
         self._center_split.setCollapsible(0, False)
-        body.addWidget(self._center_split, stretch=5)
+        self._center_split.setSizes([430, 250])
 
+        # Original conversation/file/command widgets become the real CHAT page.
         self._right_panel = self._build_right_panel()
-        body.addWidget(self._right_panel, stretch=0)
+        self._right_panel.setMinimumWidth(0)
+        self._right_panel.setMaximumWidth(16777215)
+        self._right_panel.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding
+        )
 
-        root.addLayout(body, stretch=1)
+        # The page stack makes the top menu true navigation instead of resizing one screen.
+        self._workspace_stack = QStackedWidget()
+        self._workspace_stack.setStyleSheet(
+            f"background:{C.BG}; border:none;"
+        )
+
+        self._home_page = self._build_real_home_page()
+        self._system_page = self._build_real_system_page()
+
+        self._kira_page = QWidget()
+        _kira_layout = QVBoxLayout(self._kira_page)
+        _kira_layout.setContentsMargins(12, 10, 12, 10)
+        _kira_layout.setSpacing(8)
+        _kira_title = QLabel("KIRA // CORE")
+        _kira_title.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
+        _kira_title.setStyleSheet(
+            f"color:{C.WHITE}; background:transparent; letter-spacing:2px;"
+        )
+        _kira_layout.addWidget(_kira_title)
+        _kira_layout.addWidget(self._center_split, 1)
+
+        self._tasks_page = self._build_real_tasks_page()
+
+        self._chat_page = QWidget()
+        _chat_layout = QVBoxLayout(self._chat_page)
+        _chat_layout.setContentsMargins(12, 10, 12, 10)
+        _chat_layout.setSpacing(8)
+        _chat_title = QLabel("CHAT // CONVERSATION")
+        _chat_title.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
+        _chat_title.setStyleSheet(
+            f"color:{C.WHITE}; background:transparent; letter-spacing:2px;"
+        )
+        _chat_layout.addWidget(_chat_title)
+        _chat_layout.addWidget(self._right_panel, 1)
+
+        for _page in (
+            self._home_page,
+            self._system_page,
+            self._kira_page,
+            self._tasks_page,
+            self._chat_page,
+        ):
+            self._workspace_stack.addWidget(_page)
+
+        root.addWidget(self._workspace_stack, 1)
+        self._workspace_stack.setCurrentIndex(0)
         root.addWidget(self._build_footer())
 
         # Quick-access drawer (floating overlay, built after central widget layout is done)
@@ -2884,12 +3100,17 @@ class MainWindow(QMainWindow):
         # Metric update timer
         self._metric_tmr = QTimer(self)
         self._metric_tmr.timeout.connect(self._update_metrics)
+        self._metric_tmr.timeout.connect(self._update_kira_page_metrics)
         self._metric_tmr.start(2000)
         self._update_metrics()
 
         self._log_sig.connect(self._log.append_log)
+        self._log_sig.connect(self._home_activity.append)
+        self._log_sig.connect(self._tasks_feed.append)
         self._state_sig.connect(self._apply_state)
+        self._state_sig.connect(self._mirror_kira_state)
         self._content_sig.connect(self._show_content)
+        self._content_sig.connect(self._mirror_kira_content)
         self._reconfig_sig.connect(self._show_setup)
         self._camera_sig.connect(self._show_camera_frame)
         self._confirm_sig.connect(self._show_confirm_banner)
@@ -2919,6 +3140,305 @@ class MainWindow(QMainWindow):
         sc_full.activated.connect(self._toggle_fullscreen)
         sc_intr = QShortcut(QKeySequence("Escape"), self)
         sc_intr.activated.connect(self._do_interrupt)
+
+    def _kira_section_title(self, title: str) -> QLabel:
+        lab = QLabel(title)
+        lab.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        lab.setStyleSheet(
+            f"color:{C.WHITE}; background:transparent; letter-spacing:1px;"
+        )
+        return lab
+
+    def _kira_metric_box(self, name: str):
+        box = QWidget()
+        box.setStyleSheet(
+            f"background:{C.PANEL}; border:1px solid {C.BORDER}; border-radius:4px;"
+        )
+        lay = QVBoxLayout(box)
+        lay.setContentsMargins(10, 8, 10, 8)
+        lay.setSpacing(4)
+
+        n = QLabel(name)
+        n.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+        n.setStyleSheet(f"color:{C.TEXT_MED}; background:transparent;")
+
+        value = QLabel("--")
+        value.setFont(QFont("Courier New", 15, QFont.Weight.Bold))
+        value.setStyleSheet(f"color:{C.WHITE}; background:transparent;")
+
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(0)
+        bar.setTextVisible(False)
+        bar.setFixedHeight(7)
+        bar.setStyleSheet(
+            f"QProgressBar {{ background:{C.BAR_BG}; border:none; }}"
+            f"QProgressBar::chunk {{ background:{C.PRI}; }}"
+        )
+
+        lay.addWidget(n)
+        lay.addWidget(value)
+        lay.addWidget(bar)
+        return box, value, bar
+
+    def _build_real_home_page(self) -> QWidget:
+        page = QWidget()
+        outer = QHBoxLayout(page)
+        outer.setContentsMargins(12, 10, 12, 10)
+        outer.setSpacing(10)
+
+        # LEFT — compact live system panel.
+        left = QWidget()
+        left.setStyleSheet(f"background:{C.DARK}; border:1px solid {C.BORDER};")
+        lv = QVBoxLayout(left)
+        lv.setContentsMargins(10, 10, 10, 10)
+        lv.setSpacing(8)
+        lv.addWidget(self._kira_section_title("SYSTEM // LIVE"))
+
+        c, self._home_cpu, self._home_cpu_bar = self._kira_metric_box("CPU")
+        lv.addWidget(c)
+        c, self._home_ram, self._home_ram_bar = self._kira_metric_box("RAM")
+        lv.addWidget(c)
+        c, self._home_net, self._home_net_bar = self._kira_metric_box("NETWORK")
+        lv.addWidget(c)
+        c, self._home_temp, self._home_temp_bar = self._kira_metric_box("TEMP")
+        lv.addWidget(c)
+        lv.addStretch()
+        outer.addWidget(left, 3)
+
+        # CENTER — a separate compact live KIRA orb and useful briefing.
+        center = QWidget()
+        cv = QVBoxLayout(center)
+        cv.setContentsMargins(0, 0, 0, 0)
+        cv.setSpacing(10)
+
+        core_box = QWidget()
+        core_box.setStyleSheet(f"background:{C.DARK}; border:1px solid {C.BORDER};")
+        core_l = QVBoxLayout(core_box)
+        core_l.setContentsMargins(8, 8, 8, 8)
+        core_l.addWidget(self._kira_section_title("KIRA // INTELLIGENCE"))
+        self._home_core = KiraCoreV2(self._face_path, self._assistant_name.upper())
+        self._home_core.setMinimumHeight(300)
+        core_l.addWidget(self._home_core, 1)
+        cv.addWidget(core_box, 5)
+
+        brief_box = QWidget()
+        brief_box.setStyleSheet(f"background:{C.DARK}; border:1px solid {C.BORDER};")
+        brief_l = QVBoxLayout(brief_box)
+        brief_l.setContentsMargins(10, 8, 10, 8)
+        brief_l.addWidget(self._kira_section_title("BRIEFING // INTELLIGENCE"))
+        self._home_briefing = QTextEdit()
+        self._home_briefing.setReadOnly(True)
+        self._home_briefing.setFrameShape(QFrame.Shape.NoFrame)
+        self._home_briefing.setFont(QFont("Courier New", 8))
+        self._home_briefing.setStyleSheet(
+            f"background:transparent; color:{C.TEXT_MED}; border:none;"
+        )
+        self._home_briefing.setPlainText(
+            "KIRA lista.\\n\\n"
+            "• Esperando instrucciones.\\n"
+            "• Noticias, búsquedas y briefings aparecerán aquí.\\n"
+            "• Si una fuente no devuelve resultados, se mostrará contexto útil."
+        )
+        brief_l.addWidget(self._home_briefing, 1)
+        cv.addWidget(brief_box, 2)
+
+        outer.addWidget(center, 6)
+
+        # RIGHT — recent activity.
+        right = QWidget()
+        right.setStyleSheet(f"background:{C.DARK}; border:1px solid {C.BORDER};")
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(10, 10, 10, 10)
+        rv.setSpacing(8)
+        rv.addWidget(self._kira_section_title("ACTIVITY // RECENT"))
+
+        self._home_activity = QTextEdit()
+        self._home_activity.setReadOnly(True)
+        self._home_activity.setFrameShape(QFrame.Shape.NoFrame)
+        self._home_activity.setFont(QFont("Courier New", 8))
+        self._home_activity.setStyleSheet(
+            f"background:transparent; color:{C.TEXT}; border:none;"
+        )
+        self._home_activity.setPlainText("KIRA online.\\nEsperando actividad...")
+        rv.addWidget(self._home_activity, 1)
+
+        self._home_state = QLabel("●  READY")
+        self._home_state.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        self._home_state.setStyleSheet(
+            f"color:{C.PRI}; background:{C.PANEL2}; "
+            f"border:1px solid {C.BORDER}; padding:8px;"
+        )
+        rv.addWidget(self._home_state)
+
+        outer.addWidget(right, 4)
+        return page
+
+    def _build_real_system_page(self) -> QWidget:
+        page = QWidget()
+        lay = QHBoxLayout(page)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(10)
+
+        # Reuse original live system panel.
+        lay.addWidget(self._left_panel, 0)
+
+        details = QWidget()
+        details.setStyleSheet(
+            f"background:{C.DARK}; border:1px solid {C.BORDER};"
+        )
+        dv = QVBoxLayout(details)
+        dv.setContentsMargins(14, 12, 14, 12)
+        dv.setSpacing(10)
+        dv.addWidget(self._kira_section_title("SYSTEM // STATUS & PERFORMANCE"))
+
+        row1 = QHBoxLayout()
+        c, self._sys_cpu, self._sys_cpu_bar = self._kira_metric_box("CPU LOAD")
+        row1.addWidget(c)
+        c, self._sys_ram, self._sys_ram_bar = self._kira_metric_box("MEMORY")
+        row1.addWidget(c)
+        dv.addLayout(row1)
+
+        row2 = QHBoxLayout()
+        c, self._sys_net, self._sys_net_bar = self._kira_metric_box("NETWORK")
+        row2.addWidget(c)
+        c, self._sys_temp, self._sys_temp_bar = self._kira_metric_box("TEMPERATURE")
+        row2.addWidget(c)
+        dv.addLayout(row2)
+
+        info = QTextEdit()
+        info.setReadOnly(True)
+        info.setFont(QFont("Courier New", 9))
+        info.setStyleSheet(
+            f"background:{C.PANEL}; color:{C.TEXT_MED}; "
+            f"border:1px solid {C.BORDER}; padding:10px;"
+        )
+        info.setPlainText(
+            "KIRA SYSTEM MONITOR\\n\\n"
+            "Esta página está dedicada al estado del equipo.\\n"
+            "Ya no comparte la misma vista con CHAT o TASKS."
+        )
+        dv.addWidget(info, 1)
+
+        lay.addWidget(details, 1)
+        return page
+
+    def _build_real_tasks_page(self) -> QWidget:
+        page = QWidget()
+        lay = QVBoxLayout(page)
+        lay.setContentsMargins(12, 10, 12, 10)
+        lay.setSpacing(8)
+
+        head = QHBoxLayout()
+        head.addWidget(self._kira_section_title("TASKS // ACTIVITY"))
+        head.addStretch()
+
+        for label in ("ALL", "RUNNING", "PENDING", "COMPLETED"):
+            btn = QPushButton(label)
+            btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
+            btn.setStyleSheet(
+                f"QPushButton {{ color:{C.TEXT_MED}; background:{C.PANEL}; "
+                f"border:1px solid {C.BORDER}; padding:6px 10px; }}"
+                f"QPushButton:hover {{ color:{C.WHITE}; border-color:{C.PRI_DIM}; }}"
+            )
+            head.addWidget(btn)
+
+        lay.addLayout(head)
+
+        desc = QLabel(
+            "Vista independiente para tareas, procesos, cancelaciones y herramientas."
+        )
+        desc.setWordWrap(True)
+        desc.setFont(QFont("Courier New", 8))
+        desc.setStyleSheet(
+            f"color:{C.TEXT_MED}; background:{C.PANEL2}; "
+            f"border:1px solid {C.BORDER}; padding:9px;"
+        )
+        lay.addWidget(desc)
+
+        self._tasks_feed = QTextEdit()
+        self._tasks_feed.setReadOnly(True)
+        self._tasks_feed.setFont(QFont("Courier New", 9))
+        self._tasks_feed.setStyleSheet(
+            f"background:{C.DARK}; color:{C.TEXT}; "
+            f"border:1px solid {C.BORDER}; padding:10px;"
+        )
+        self._tasks_feed.setPlainText(
+            "TASK QUEUE READY\\n\\n"
+            "No hay actividad registrada todavía.\\n"
+            "Las acciones de KIRA se reflejarán aquí."
+        )
+        lay.addWidget(self._tasks_feed, 1)
+        return page
+
+    def _app_view(self, mode: str) -> None:
+        pages = {
+            "home": 0,
+            "system": 1,
+            "core": 2,
+            "activity": 3,
+            "chat": 4,
+        }
+        idx = pages.get(mode, 0)
+        if hasattr(self, "_workspace_stack"):
+            self._workspace_stack.setCurrentIndex(idx)
+
+    def _update_kira_page_metrics(self) -> None:
+        try:
+            cpu = float(_metrics.cpu)
+            ram = float(_metrics.mem)
+            net = float(_metrics.net)
+            temp = float(_metrics.tmp)
+        except Exception:
+            return
+
+        net_pct = min(100.0, net * 8.0)
+        temp_pct = 0 if temp < 0 else min(100.0, temp)
+
+        def put(lbl_name, bar_name, text_value, pct):
+            lbl = getattr(self, lbl_name, None)
+            bar = getattr(self, bar_name, None)
+            if lbl is not None:
+                lbl.setText(text_value)
+            if bar is not None:
+                bar.setValue(max(0, min(100, int(pct))))
+
+        put("_home_cpu", "_home_cpu_bar", f"{cpu:.0f}%", cpu)
+        put("_home_ram", "_home_ram_bar", f"{ram:.0f}%", ram)
+        put("_home_net", "_home_net_bar", f"{net:.2f} MB/s", net_pct)
+        put("_home_temp", "_home_temp_bar", "N/A" if temp < 0 else f"{temp:.0f}°C", temp_pct)
+
+        put("_sys_cpu", "_sys_cpu_bar", f"{cpu:.0f}%", cpu)
+        put("_sys_ram", "_sys_ram_bar", f"{ram:.0f}%", ram)
+        put("_sys_net", "_sys_net_bar", f"{net:.2f} MB/s", net_pct)
+        put("_sys_temp", "_sys_temp_bar", "N/A" if temp < 0 else f"{temp:.0f}°C", temp_pct)
+
+    def _mirror_kira_state(self, state: str) -> None:
+        try:
+            self._home_core.state = state
+            self._home_core.update()
+            self._home_state.setText("●  " + str(state).upper())
+        except Exception:
+            pass
+
+    def _mirror_kira_content(self, title: str, body: str) -> None:
+        txt = str(body or "").strip()
+        if txt.lower().startswith("no news found"):
+            title = "BRIEFING // STATUS"
+            txt = (
+                "No se encontraron noticias verificadas para esa consulta.\\n\\n"
+                "KIRA sigue disponible.\\n"
+                "• Prueba otra búsqueda.\\n"
+                "• Revisa actividad reciente.\\n"
+                "• El sistema y el contexto continúan activos."
+            )
+
+        try:
+            self._home_briefing.setPlainText(
+                str(title).upper() + "\\n\\n" + txt
+            )
+        except Exception:
+            pass
 
     def _show_camera_frame(self, img_bytes: bytes):
         """Slot — display camera preview overlay (main thread)."""
@@ -3927,6 +4447,10 @@ class MainWindow(QMainWindow):
 
     def _show_content(self, title: str, text: str):
         """Slot — runs on Qt main thread. Updates and shows the content panel."""
+        if str(text or "").strip().lower().startswith("no news found"):
+            title = "BRIEFING // STATUS"
+            text = ("No se encontraron noticias verificadas para esa consulta.\n\n"
+                    "KIRA está lista. Puedes intentar otra búsqueda o revisar HOME.")
         import time as _time
         self._content_title_lbl.setText(title.upper()[:48])
         self._content_ts_lbl.setText(_time.strftime("%H:%M:%S"))

@@ -48,3 +48,7 @@ desktop.ini
 logs/
 downloads/
 screenshots/
+
+# KIRA local secrets and patch backups
+config/api_keys.json
+ui.py.pre_kira_*
