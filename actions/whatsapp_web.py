@@ -120,6 +120,7 @@ class _WhatsAppWorker:
         self._last_candidates = []
         self._last_candidate_query = ""
         self._last_candidates_at = 0.0
+        self._pending_operation = None
 
     def call(self, params, timeout=90):
         done = queue.Queue(maxsize=1)
@@ -382,7 +383,7 @@ class _WhatsAppWorker:
         if len(ranked) > 1:
             second = ranked[1][0]
             margin = 0.10 if multi else 0.08
-            if best_score < 0.97 and (best_score - second) < margin:
+            if (best_score - second) < margin:
                 return None, candidates
 
         best = dict(best)
@@ -426,6 +427,7 @@ class _WhatsAppWorker:
         self._last_candidates = []
         self._last_candidate_query = ""
         self._last_candidates_at = 0.0
+        self._pending_operation = None
 
     def _candidate_choice(self, candidate_id="", candidate_index=0):
         """Selecciona solo desde la última lista ambigua, nunca por adivinanza."""
@@ -434,11 +436,18 @@ class _WhatsAppWorker:
 
         if not cached:
             return None, "No hay una lista de coincidencias pendiente."
-        if age > 300:
+        # Valid only on [created, created + 300 seconds).
+        if age >= 300:
             self._clear_candidates()
             return None, "La lista de coincidencias expiró; vuelve a pedir el contacto."
 
         cid = str(candidate_id or "").strip()
+        if candidate_index and (type(candidate_index) is not int or candidate_index < 1):
+            return None, "candidate_index debe ser un entero positivo."
+        if cid and candidate_index:
+            match = next((c for c in cached if c.get("option") == candidate_index), None)
+            if not match or str(match.get("id")) != cid:
+                return None, "candidate_id y candidate_index se contradicen."
         if cid:
             for c in cached:
                 if str(c.get("id") or "") == cid:
@@ -801,7 +810,7 @@ class _WhatsAppWorker:
         now = time.time()
         last_id, last_text, last_ts = self._last_send
         if chat_id == last_id and text == last_text and now - last_ts < 10:
-            return {"ok": True, "duplicate_suppressed": True, "verified": True, "verification": "duplicate_guard"}
+            return {"ok": True, "duplicate_suppressed": True, "verified": False, "verification": "duplicate_guard_unconfirmed"}
 
         result = page.evaluate("""async ({id, text}) => {
             try {
@@ -820,7 +829,8 @@ class _WhatsAppWorker:
                 page.wait_for_timeout(350)
                 msgs = self._messages(page, chat_id, 12)
                 for m in reversed(msgs):
-                    if m.get("fromMe") and (m.get("text") or "").strip() == text.strip():
+                    if (result.get("messageId") and m.get("id") == result["messageId"]
+                            and m.get("fromMe") and (m.get("text") or "").strip() == text.strip()):
                         result["verified"] = True
                         result["verification"] = "WPP.chat.getMessages"
                         return result
@@ -836,10 +846,7 @@ class _WhatsAppWorker:
         chat = str(p.get("chat", "") or "").strip()
         message = str(p.get("message", "") or "").strip()
         candidate_id = str(p.get("candidate_id", "") or "").strip()
-        try:
-            candidate_index = max(0, int(p.get("candidate_index", 0) or 0))
-        except Exception:
-            candidate_index = 0
+        candidate_index = p.get("candidate_index", 0)
         direction = _norm(p.get("direction", "all"))
         try:
             limit = max(1, min(int(p.get("limit", 10) or 10), 30))
@@ -869,6 +876,7 @@ class _WhatsAppWorker:
             action = "close"
 
         if action == "close":
+            self._clear_candidates()
             # Close ONLY the dedicated WhatsApp Playwright window/context.
             # Never call the generic application/window closer here.
             try:
@@ -889,6 +897,39 @@ class _WhatsAppWorker:
                 "target": "WhatsApp Web Chromium",
                 "kira_remains_running": True
             })
+
+        # Validate explicit selection before any browser access or active-chat fallback.
+        choosing = "candidate_index" in p or "candidate_id" in p
+        if "candidate_index" in p and (type(candidate_index) is not int or not 1 <= candidate_index <= 5):
+            return "WHATSAPP_UNVERIFIED: candidate_index debe ser un entero entre 1 y 5."
+        if "candidate_id" in p and (not isinstance(p["candidate_id"], str) or not candidate_id):
+            return "WHATSAPP_UNVERIFIED: candidate_id inválido."
+        if choosing:
+            selected, error = self._candidate_choice(candidate_id, candidate_index)
+            pending = self._pending_operation
+            if not selected or not pending:
+                return "WHATSAPP_UNVERIFIED: " + (error or "No hay operación pendiente.")
+            if action not in {"select", pending["action"]}:
+                return "WHATSAPP_UNVERIFIED: La acción contradice la operación pendiente."
+            if chat and _norm(chat) not in {_norm(pending["chat"]), _norm(selected.get("name", ""))}:
+                return "WHATSAPP_UNVERIFIED: El destinatario contradice la selección."
+            if "message" in p and message != pending["message"]:
+                return "WHATSAPP_UNVERIFIED: El mensaje contradice la operación pendiente."
+            if "direction" in p and direction != pending["direction"]:
+                return "WHATSAPP_UNVERIFIED: La dirección contradice la operación pendiente."
+            if "limit" in p and limit != pending["limit"]:
+                return "WHATSAPP_UNVERIFIED: El límite contradice la operación pendiente."
+            action = "select" if pending["action"] == "search" else pending["action"]
+            chat, message = pending["chat"], pending["message"]
+            direction, limit = pending["direction"], pending["limit"]
+        elif chat:
+            # A new named operation invalidates the old list, even if lookup fails.
+            self._clear_candidates()
+            self._pending_operation = dict(action=action, chat=chat, message=message,
+                                           direction=direction, limit=limit)
+        elif self._last_candidates and action in {"send", "read", "select", "last_incoming",
+                                                  "last_outgoing", "last_audio", "play_audio", "transcribe_audio"}:
+            return "WHATSAPP_UNVERIFIED: Hay candidatos pendientes; selecciona una opción explícita."
 
         page = self._ensure_page()
         self._bring_front(page)
@@ -1085,8 +1126,9 @@ class _WhatsAppWorker:
 
             sent = self._send(page, chat_id, message)
             if sent.get("ok"):
-                return _dump("WHATSAPP_VERIFIED_SENT", {
+                return _dump("WHATSAPP_VERIFIED_SENT" if sent.get("verified") else "WHATSAPP_SEND_REQUESTED", {
                     "chat": chat_name, "id": chat_id, "message": message,
+                    "messageId": sent.get("messageId"),
                     "verified": bool(sent.get("verified")),
                     "verification": sent.get("verification"),
                     "duplicate_suppressed": bool(sent.get("duplicate_suppressed")),
@@ -1127,7 +1169,10 @@ TOOL = {
         "resuelve chats/contactos, conoce el chat activo, abre, lee y envía sin depender "
         "de selectores DOM del encabezado o del cuadro de mensaje. "
         "Para una orden de envío usa UNA sola llamada action=send. "
-        "Antes de enviar verifica el destinatario por id exacto. También puede reproducir y, solo cuando se pide, transcribir notas de voz recibidas."
+        "Antes de enviar verifica el destinatario por id exacto. Ante ambigüedad espera la elección explícita del usuario; "
+        "action=select con candidate_index/candidate_id continúa la operación y texto pendientes durante menos de 300 segundos. "
+        "No inventes una selección ni inicies envíos sin petición del usuario. WHATSAPP_SEND_REQUESTED no confirma el envío. "
+        "También puede reproducir y, solo cuando se pide, transcribir notas de voz recibidas."
     ),
     "parameters": {
         "type": "OBJECT",
