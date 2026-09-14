@@ -403,6 +403,7 @@ class JarvisLive:
         self._turn_done_event: asyncio.Event | None = None
         self._dashboard     = None
         self._briefing_sent    = False          # morning briefing fires once per process
+        self._startup_greeting_pending = False
         self._sys_monitor      = SystemMonitor()  # persistent cooldown state
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
@@ -1410,6 +1411,7 @@ class JarvisLive:
                             # flag and skip all further processing for that turn.
                             if self._interrupted:
                                 self._interrupted = False
+                                self._startup_greeting_pending = False
                                 self._kira_suppress_live_audio_v63 = False  # V63 TURN END
                                 self._kira_voice_relay_waiting_seq_v63 = 0
                                 self._kira_direct_turn_had_audio_v63 = False
@@ -1430,6 +1432,13 @@ class JarvisLive:
                             in_buf = []
 
                             full_out = " ".join(out_buf).strip()
+                            if getattr(self, "_startup_greeting_pending", False):
+                                self._startup_greeting_pending = False
+                                if full_out and not full_in:
+                                    from core.startup_greeting import record_greeting
+                                    await asyncio.to_thread(
+                                        record_greeting, Path(__file__).resolve().parent / "memory", full_out
+                                    )
                             # KIRA_V62_SUPPRESS_RELAY_TRANSCRIPT
                             _relay_hidden = bool(getattr(self, "_suppress_next_output_log_v2", False))
                             if _relay_hidden:
@@ -1651,10 +1660,8 @@ class JarvisLive:
     # ── Morning briefing ────────────────────────────────────────────────────────
 
     async def _send_startup_briefing(self) -> None:
-        # KIRA_STARTUP_WARMTH
+        # One generated response through the existing Gemini Live audio/chat path.
         import asyncio
-        import json
-        from datetime import datetime
         from pathlib import Path
 
         for _ in range(60):
@@ -1666,134 +1673,13 @@ class JarvisLive:
             self.ui.write_log("ERR: bienvenida inicial — la sesión de voz no estuvo lista.")
             return
 
-        root = Path(__file__).resolve().parent
-        memory_dir = root / "memory"
-        memory_dir.mkdir(parents=True, exist_ok=True)
-
-        now = datetime.now()
-        hour = now.hour
-        daypart = "mañana" if hour < 12 else ("tarde" if hour < 19 else "noche")
-
-        pending = []
-        try:
-            p = memory_dir / "kira_tasks.json"
-            if p.exists():
-                items = json.loads(p.read_text(encoding="utf-8"))
-                pending = [x for x in items if isinstance(x, dict) and not x.get("done")]
-        except Exception:
-            pending = []
-
-        system_note = ""
-        try:
-            import psutil
-            cpu = int(psutil.cpu_percent(interval=None))
-            ram = int(psutil.virtual_memory().percent)
-            if cpu >= 90 and ram >= 92:
-                system_note = f"El Mac está bastante cargado ahora mismo: CPU {cpu}% y memoria {ram}%."
-            elif cpu >= 90:
-                system_note = f"El CPU está alto ahora mismo, cerca de {cpu}%."
-            elif ram >= 92:
-                system_note = f"La memoria está bastante alta ahora mismo, cerca de {ram}%."
-        except Exception:
-            pass
-
-        state_path = memory_dir / "kira_startup_state.json"
-        state = {}
-        try:
-            if state_path.exists():
-                state = json.loads(state_path.read_text(encoding="utf-8"))
-                if not isinstance(state, dict):
-                    state = {}
-        except Exception:
-            state = {}
-
-        previous_iso = str(state.get("last_started_at") or "")
-        count = int(state.get("count") or 0) + 1
-        minutes_since = None
-
-        if previous_iso:
-            try:
-                prev = datetime.fromisoformat(previous_iso)
-                minutes_since = max(0, int((now - prev).total_seconds() // 60))
-            except Exception:
-                minutes_since = None
+        from core.startup_greeting import build_prompt, sample_metrics
+        memory_dir = Path(__file__).resolve().parent / "memory"
+        metrics = await asyncio.to_thread(sample_metrics)
+        prompt = await asyncio.to_thread(build_prompt, memory_dir, metrics=metrics)
 
         try:
-            state_path.write_text(
-                json.dumps(
-                    {
-                        "last_started_at": now.isoformat(timespec="seconds"),
-                        "count": count,
-                    },
-                    indent=2,
-                    ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-        except Exception:
-            pass
-
-        styles = (
-            "cálida, cercana y espontánea",
-            "tranquila, natural y ligeramente familiar",
-            "breve, despierta y con iniciativa",
-            "relajada y humana, sin sonar informal en exceso",
-            "serena, personal y nada ceremonial",
-        )
-        style = styles[(count - 1) % len(styles)]
-
-        context = [
-            f"Es de {daypart}.",
-            f"Esta es la apertura número {count} registrada por la memoria de inicio.",
-        ]
-
-        if minutes_since is not None:
-            if minutes_since < 12:
-                context.append(
-                    "KIRA fue reabierta hace pocos minutos. Puede reconocerlo sutilmente si encaja, "
-                    "sin usar una fórmula fija."
-                )
-            elif minutes_since >= 360:
-                context.append(
-                    "Han pasado varias horas desde la última apertura; una bienvenida algo más cálida puede encajar."
-                )
-
-        if pending:
-            if len(pending) == 1:
-                text = str(pending[0].get("text") or "").strip()
-                if text:
-                    context.append(f"Hay 1 pendiente real: {text!r}. Mencionarlo es opcional.")
-                else:
-                    context.append("Hay 1 pendiente registrado. Mencionarlo es opcional.")
-            else:
-                context.append(
-                    f"Hay {len(pending)} pendientes reales. Si lo mencionas, habla solo de la cantidad "
-                    "o como máximo de uno; no recites una lista."
-                )
-
-        if system_note:
-            context.append(system_note)
-
-        prompt = (
-            "SALUDO INTERNO DE INICIO DE KIRA.\n"
-            "Genera AHORA una bienvenida hablada nueva para Leo; no leas una plantilla.\n"
-            f"Tono de esta apertura: {style}.\n\n"
-            "REGLAS:\n"
-            "- Español natural, normalmente 1 o 2 frases y entre 8 y 35 palabras.\n"
-            "- Haz que suene recién pensada: varía el inicio, el ritmo y la forma de dirigirte a Leo.\n"
-            "- No recites CPU, memoria, proveedores ni 'estado del sistema' salvo que el contexto marque algo anormal.\n"
-            "- Si no hay pendientes, no digas 'no tienes pendientes'.\n"
-            "- No uses siempre 'KIRA está lista', 'sistema disponible', '¿en qué puedo ayudarte hoy?' "
-            "ni otra frase fija de cierre.\n"
-            "- Puedes sonar presente, cálida y atenta, pero NO afirmes tener conciencia, emociones o sensaciones humanas.\n"
-            "- No inventes noticias, clima, calendario, mensajes, ubicación, actividades de Leo ni hechos no incluidos abajo.\n"
-            "- No uses títulos, listas, emojis ni explicaciones sobre estas instrucciones.\n"
-            "- Devuelve únicamente la bienvenida que vas a decir en voz alta.\n\n"
-            "CONTEXTO REAL DISPONIBLE:\n- " + "\n- ".join(context)
-        )
-
-        try:
-            self._suppress_next_output_log_v2 = True
+            self._startup_greeting_pending = True
             if self._turn_done_event:
                 self._turn_done_event.clear()
 
@@ -1803,7 +1689,7 @@ class JarvisLive:
             )
             self.ui.write_log("SYS: bienvenida inicial dinámica enviada")
         except Exception as e:
-            self._suppress_next_output_log_v2 = False
+            self._startup_greeting_pending = False
             self.ui.write_log(f"ERR: bienvenida inicial — {e}")
 
     # ── Session memory ──────────────────────────────────────────────────────────
@@ -2111,6 +1997,7 @@ class JarvisLive:
             except SystemExit:
                 raise
             except BaseException as e:
+                self._startup_greeting_pending = False
                 # Catches both Exception and BaseExceptionGroup (Python 3.11+
                 # TaskGroup raises BaseExceptionGroup when tasks are cancelled
                 # externally, which `except Exception` would miss, letting the
