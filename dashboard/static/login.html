@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-  <title>JARVIS</title>
+  <title>KIRA Remote</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
@@ -134,10 +134,10 @@
 </head>
 <body>
   <div class="card" id="card">
-    <div class="logo"><em>J</em>ARVIS</div>
+    <div class="logo">KIRA</div>
     <div class="sub">Remote Access</div>
     <p id="reconnecting">Reconnecting…</p>
-    <p class="hint">Press <strong style="color:var(--text)">Remote Control</strong> in the JARVIS desktop app to get a QR code or session key.</p>
+    <p class="hint">Press <strong style="color:var(--text)">Remote Control</strong> in the KIRA desktop app to get a QR code or session key.</p>
     <div class="key-wrap">
       <input class="key-input" id="key" type="text" maxlength="6"
              autocomplete="off" autocorrect="off" spellcheck="false"
@@ -145,16 +145,12 @@
     </div>
     <div class="err" id="err"></div>
     <button class="btn" onclick="doLogin()">CONNECT</button>
-    <p class="voice-note">
-      🎤 <strong style="color:var(--text)">Voice commands:</strong> open
-      <code>chrome://flags</code> on your phone, search
-      <code>Insecure origins treated as secure</code>, add your JARVIS URL, tap Relaunch.
-    </p>
+    <p class="voice-note"><strong style="color:var(--text)">iPhone:</strong> after the first pairing, KIRA remembers this phone. For microphone access, complete the one-time HTTPS trust setup shown by KIRA on your Mac.</p>
   </div>
 
   <script>
-    // Try auto-reconnect with stored device token (set on first QR login)
-    (async function() {
+    // Auto-reconnect with the persistent paired-device token.
+    (async function reconnectKnownPhone() {
       const devTok = localStorage.getItem('jarvis_device_token');
       if (!devTok) return;
       document.getElementById('reconnecting').style.display = 'block';
@@ -164,16 +160,24 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ device_token: devTok }),
         });
+        if (r.status === 401) {
+          // Explicitly revoked/invalid, not a temporary network failure.
+          localStorage.removeItem('jarvis_device_token');
+          document.getElementById('reconnecting').style.display = 'none';
+          return;
+        }
         const d = await r.json();
-        if (d.ok && d.token) {
+        if (d.ok && d.token && d.key) {
           sessionStorage.setItem('jarvis_key', d.key);
           sessionStorage.setItem('jarvis_token', d.token);
           location.replace('/');
           return;
         }
-      } catch (_) {}
-      // Device token rejected (server restarted) — clear it and show normal form
-      localStorage.removeItem('jarvis_device_token');
+      } catch (_) {
+        // Keep the pairing token. A temporary Wi-Fi/server failure must not unpair the phone.
+        setTimeout(reconnectKnownPhone, 1800);
+        return;
+      }
       document.getElementById('reconnecting').style.display = 'none';
     })();
 
@@ -202,8 +206,9 @@
         shake(); return;
       }
       if (data.ok && data.token) {
-        sessionStorage.setItem('jarvis_key', key);
+        sessionStorage.setItem('jarvis_key', data.key || key);
         sessionStorage.setItem('jarvis_token', data.token);
+        if (data.device_token) localStorage.setItem('jarvis_device_token', data.device_token);
         location.href = '/';
       } else {
         inp.value = '';

@@ -1130,3 +1130,20 @@ TOOL = {
     },
     "handler": browser_control,
 }
+
+# === KIRA_WHATSAPP_EXCLUSIVE_ROUTE_V2 ===
+try:
+    _KIRA_ORIGINAL_TOOL_HANDLER_V2 = TOOL.get("handler")
+except Exception:
+    _KIRA_ORIGINAL_TOOL_HANDLER_V2 = None
+if callable(_KIRA_ORIGINAL_TOOL_HANDLER_V2):
+    def _kira_whatsapp_route_guard_v2(*args, **kwargs):
+        params = args[0] if args and isinstance(args[0], dict) else kwargs.get("parameters", {})
+        params = params if isinstance(params, dict) else {}
+        joined = " ".join(str(v) for v in params.values()).lower()
+        action = str(params.get("action", "")).lower()
+        if "web.whatsapp.com" in joined or ("whatsapp" in joined and action in {"open","abrir","new_tab","navigate","go","send","message"}):
+            return "KIRA_ROUTE_BLOCKED: WhatsApp está reservado para whatsapp_web. No se abrió Safari, Chrome ni una app alternativa."
+        return _KIRA_ORIGINAL_TOOL_HANDLER_V2(*args, **kwargs)
+    TOOL["handler"] = _kira_whatsapp_route_guard_v2
+# === END_KIRA_WHATSAPP_EXCLUSIVE_ROUTE_V2 ===

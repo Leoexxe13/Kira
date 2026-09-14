@@ -1,5 +1,5 @@
 """
-dashboard/server.py — JARVIS Local HTTP Dashboard
+dashboard/server.py — KIRA Local Remote Dashboard
 
 Plain HTTP on port 8000 (no SSL warnings, no firewall issues).
 Security at the application layer: AES-256-CBC with session-key-derived key.
@@ -11,11 +11,17 @@ Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 import asyncio
 import base64
 import hashlib
+import ipaddress
+import json
+import os
 import re
 import secrets
 import socket
 import string
+import threading
 import time
+from datetime import datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 _DEPS_OK = False
@@ -56,7 +62,199 @@ def _make_uploads_dir() -> Path:
     return BASE_DIR / "uploads"
 
 
+
 UPLOADS_DIR = _make_uploads_dir()
+
+# Persistent mobile pairing + local HTTPS identity.
+DEVICE_STORE = BASE_DIR / "config" / "dashboard_devices.json"
+CERT_DIR     = BASE_DIR / "config" / "certs"
+CA_KEY       = CERT_DIR / "kira_local_ca.key"
+CA_PEM       = CERT_DIR / "kira_local_ca.pem"
+CA_CER       = CERT_DIR / "kira-local-ca.cer"
+SERVER_KEY   = CERT_DIR / "jarvis.key"   # keep legacy filenames for compatibility
+SERVER_CERT  = CERT_DIR / "jarvis.crt"
+SETUP_PORT   = PORT + 1
+
+
+def _device_hash(token: str) -> str:
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+
+def _load_device_store() -> dict:
+    try:
+        if DEVICE_STORE.exists():
+            data = json.loads(DEVICE_STORE.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                return data
+    except Exception:
+        pass
+    return {}
+
+
+def _save_device_store(data: dict) -> None:
+    DEVICE_STORE.parent.mkdir(parents=True, exist_ok=True)
+    tmp = DEVICE_STORE.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    os.replace(tmp, DEVICE_STORE)
+    try:
+        os.chmod(DEVICE_STORE, 0o600)
+    except Exception:
+        pass
+
+
+def _ensure_tls_material(ip: str) -> bool:
+    """Create one local CA and renew the LAN server certificate for the current IP."""
+    try:
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes, serialization
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.x509.oid import NameOID, ExtendedKeyUsageOID
+
+        CERT_DIR.mkdir(parents=True, exist_ok=True)
+        now = datetime.utcnow()
+
+        if CA_KEY.exists() and CA_PEM.exists():
+            ca_key = serialization.load_pem_private_key(CA_KEY.read_bytes(), password=None)
+            ca_cert = x509.load_pem_x509_certificate(CA_PEM.read_bytes())
+        else:
+            ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+            ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "KIRA Local CA")])
+            ca_cert = (
+                x509.CertificateBuilder()
+                .subject_name(ca_name)
+                .issuer_name(ca_name)
+                .public_key(ca_key.public_key())
+                .serial_number(x509.random_serial_number())
+                .not_valid_before(now - timedelta(days=1))
+                .not_valid_after(now + timedelta(days=3650))
+                .add_extension(x509.BasicConstraints(ca=True, path_length=0), critical=True)
+                .add_extension(
+                    x509.KeyUsage(
+                        digital_signature=True, content_commitment=False, key_encipherment=False,
+                        data_encipherment=False, key_agreement=False, key_cert_sign=True,
+                        crl_sign=True, encipher_only=False, decipher_only=False,
+                    ),
+                    critical=True,
+                )
+                .sign(ca_key, hashes.SHA256())
+            )
+            CA_KEY.write_bytes(
+                ca_key.private_bytes(
+                    serialization.Encoding.PEM,
+                    serialization.PrivateFormat.TraditionalOpenSSL,
+                    serialization.NoEncryption(),
+                )
+            )
+            CA_PEM.write_bytes(ca_cert.public_bytes(serialization.Encoding.PEM))
+            try:
+                os.chmod(CA_KEY, 0o600)
+            except Exception:
+                pass
+
+        # iPhone profile download prefers DER .cer.
+        CA_CER.write_bytes(ca_cert.public_bytes(serialization.Encoding.DER))
+
+        server_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        host = socket.gethostname()
+        san = [x509.DNSName(host), x509.DNSName(host + ".local")]
+        try:
+            san.append(x509.IPAddress(ipaddress.ip_address(ip)))
+        except Exception:
+            pass
+
+        leaf_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "KIRA Remote")])
+        leaf = (
+            x509.CertificateBuilder()
+            .subject_name(leaf_name)
+            .issuer_name(ca_cert.subject)
+            .public_key(server_key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(now - timedelta(days=1))
+            .not_valid_after(now + timedelta(days=397))
+            .add_extension(x509.SubjectAlternativeName(san), critical=False)
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+            .add_extension(
+                x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH]),
+                critical=False,
+            )
+            .sign(ca_key, hashes.SHA256())
+        )
+        SERVER_KEY.write_bytes(
+            server_key.private_bytes(
+                serialization.Encoding.PEM,
+                serialization.PrivateFormat.TraditionalOpenSSL,
+                serialization.NoEncryption(),
+            )
+        )
+        SERVER_CERT.write_bytes(leaf.public_bytes(serialization.Encoding.PEM))
+        try:
+            os.chmod(SERVER_KEY, 0o600)
+        except Exception:
+            pass
+        return True
+    except Exception as exc:
+        print(f"[Dashboard] HTTPS setup unavailable: {exc}")
+        return False
+
+
+def _start_setup_server(ip: str) -> None:
+    """Plain-HTTP one-time iPhone setup portal used only to install KIRA's local CA."""
+    if not CA_CER.exists():
+        return
+
+    dashboard_url = f"https://{ip}:{PORT}"
+    ca_bytes = CA_CER.read_bytes()
+    html = f"""<!doctype html>
+<html lang="es"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KIRA · Vincular iPhone</title>
+<style>
+body{{font-family:-apple-system,BlinkMacSystemFont,sans-serif;background:#050505;color:#eee;
+margin:0;padding:28px;line-height:1.5}}main{{max-width:620px;margin:auto}}h1{{letter-spacing:.18em}}
+.card{{border:1px solid #333;border-radius:16px;padding:18px;margin:16px 0;background:#0d0d0d}}
+a,button{{display:inline-block;background:#fff;color:#000;text-decoration:none;border:0;border-radius:10px;
+padding:12px 16px;font-weight:700;margin:6px 4px 6px 0}}code{{color:#bbb}}ol{{padding-left:22px}}
+.small{{color:#999;font-size:13px}}
+</style></head><body><main>
+<h1>KIRA</h1><div class="card">
+<strong>Configuración única para usar el micrófono del iPhone</strong>
+<ol>
+<li>Toca <b>Instalar certificado KIRA</b>.</li>
+<li>En iPhone: Ajustes → General → VPN y gestión de dispositivos → instala <b>KIRA Local CA</b>.</li>
+<li>Luego: Ajustes → General → Información → Ajustes de confianza de certificados → activa confianza total para <b>KIRA Local CA</b>.</li>
+<li>Vuelve aquí y toca <b>Abrir KIRA</b>.</li>
+</ol>
+<a href="/kira-local-ca.cer">Instalar certificado KIRA</a>
+<a href="{dashboard_url}">Abrir KIRA</a>
+<p class="small">Esto solo confía en el certificado local creado por tu Mac para KIRA. La clave privada de la CA permanece en tu Mac.</p>
+</div></main></body></html>"""
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *_args):
+            return
+
+        def do_GET(self):
+            if self.path.split("?", 1)[0] == "/kira-local-ca.cer":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-x509-ca-cert")
+                self.send_header("Content-Disposition", 'attachment; filename="kira-local-ca.cer"')
+                self.send_header("Content-Length", str(len(ca_bytes)))
+                self.end_headers()
+                self.wfile.write(ca_bytes)
+                return
+            body = html.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+    try:
+        httpd = ThreadingHTTPServer(("0.0.0.0", SETUP_PORT), Handler)
+    except OSError:
+        return
+    print(f"[Dashboard] iPhone first-time setup: http://{ip}:{SETUP_PORT}")
+    threading.Thread(target=httpd.serve_forever, daemon=True, name="kira-mobile-setup").start()
 
 def _get_gemini_key() -> str | None:
     try:
@@ -112,8 +310,8 @@ def _ensure_network_access(port: int) -> None:
     if sys.platform == "win32":
         import ctypes, time
 
-        port_rule = f"JARVIS Dashboard Port {port}"
-        prog_rule  = "JARVIS Dashboard Python"
+        port_rule = f"KIRA Dashboard Port {port}"
+        prog_rule  = "KIRA Dashboard Python"
         py_exe     = sys.executable
 
         def _netsh_rule_exists(name: str) -> bool:
@@ -370,6 +568,7 @@ class DashboardServer:
 
     def __init__(self):
         self._ip                          = _local_ip()
+        _ensure_tls_material(self._ip)
         self._tokens: set[str]            = set()
         self._token_keys: dict[str, str]  = {}   # auth_token → session_key
         self._aes_cache:  dict[str, bytes]= {}   # session_key → AES bytes
@@ -379,7 +578,7 @@ class DashboardServer:
         self._wake_callback               = None
         self._connect_callback            = None
         self._pending_keys: dict[str, float] = {}
-        self._device_sessions: dict[str, dict] = {}  # device_token → {session_key}
+        self._device_sessions: dict[str, dict] = _load_device_store()  # sha256(device_token) → session
         self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
         self._uploads_dir                 = UPLOADS_DIR
         self._login_html                  = _read("login.html")
@@ -397,18 +596,17 @@ class DashboardServer:
 
     @staticmethod
     def _ssl_enabled() -> bool:
-        certs = BASE_DIR / "config" / "certs"
-        return (certs / "jarvis.key").exists() and (certs / "jarvis.crt").exists()
+        return SERVER_KEY.exists() and SERVER_CERT.exists()
 
     def get_url(self) -> str:
         proto = "https" if self._ssl_enabled() else "http"
         return f"{proto}://{self._ip}:{PORT}"
 
     def get_manual_url(self) -> str:
-        """URL for manual browser entry. When HTTPS active, points to alias port (also HTTPS)."""
+        """First-time mobile setup portal when HTTPS is active; dashboard URL otherwise."""
         if self._ssl_enabled():
-            return f"{self._ip}:{PORT + 1}"
-        return f"{self._ip}:{PORT}"
+            return f"http://{self._ip}:{SETUP_PORT}"
+        return f"http://{self._ip}:{PORT}"
 
     def _aes_key(self, session_key: str) -> bytes:
         if session_key not in self._aes_cache:
@@ -423,6 +621,34 @@ class DashboardServer:
             return _decrypt_cbc(self._aes_key(sk), enc_b64)
         except Exception:
             return None
+
+    def _pair_device(self, session_key: str) -> str:
+        dev_tok = secrets.token_urlsafe(32)
+        digest = _device_hash(dev_tok)
+        self._device_sessions[digest] = {
+            "session_key": session_key,
+            "created_at": int(time.time()),
+            "last_seen": int(time.time()),
+        }
+        _save_device_store(self._device_sessions)
+        return dev_tok
+
+    def _device_session(self, dev_tok: str) -> dict | None:
+        digest = _device_hash(dev_tok)
+        item = self._device_sessions.get(digest)
+        if not isinstance(item, dict):
+            return None
+        item["last_seen"] = int(time.time())
+        self._device_sessions[digest] = item
+        _save_device_store(self._device_sessions)
+        return item
+
+    def _unpair_device(self, dev_tok: str) -> bool:
+        digest = _device_hash(dev_tok)
+        removed = self._device_sessions.pop(digest, None) is not None
+        if removed:
+            _save_device_store(self._device_sessions)
+        return removed
 
     # ── callbacks ────────────────────────────────────────────────────────
 
@@ -485,17 +711,20 @@ class DashboardServer:
             now     = time.time()
             if entered in self._pending_keys and self._pending_keys[entered] > now:
                 del self._pending_keys[entered]          # one-time use
+                session_key = secrets.token_urlsafe(32)  # long AES key; PIN is pairing only
                 tok = secrets.token_urlsafe(32)
+                dev_tok = self._pair_device(session_key)
                 self._tokens.add(tok)
-                self._token_keys[tok] = entered
-                self._aes_key(entered)                   # pre-derive & cache
+                self._token_keys[tok] = session_key
+                self._aes_key(session_key)
                 if self._connect_callback:
                     self._connect_callback()
                 asyncio.create_task(self.broadcast(
-                    {"type": "sys", "text": "Remote connection established."}
+                    {"type": "sys", "text": "KIRA Remote connected and this phone is paired."}
                 ))
-                # Bearer token in response body — no cookies needed (works on any browser/HTTP)
-                return JSONResponse({"ok": True, "token": tok})
+                return JSONResponse({
+                    "ok": True, "token": tok, "key": session_key, "device_token": dev_tok
+                })
             return JSONResponse({"ok": False, "error": "Invalid or expired key"},
                                 status_code=401)
 
@@ -512,21 +741,21 @@ class DashboardServer:
   h2{color:#f87171;margin-bottom:12px}p{color:#5e6a7e;font-size:14px}
 </style></head>
 <body><div><h2>Link Expired</h2>
-<p>Press <strong style="color:#dde3ed">Remote Control</strong> in JARVIS to get a new QR code.</p>
+<p>Press <strong style="color:#dde3ed">Remote Control</strong> in KIRA to get a new QR code.</p>
 </div></body></html>""")
 
             del self._pending_keys[key]
+            session_key = secrets.token_urlsafe(32)
             tok     = secrets.token_urlsafe(32)
-            dev_tok = secrets.token_urlsafe(32)
+            dev_tok = self._pair_device(session_key)
             self._tokens.add(tok)
-            self._token_keys[tok] = key
-            self._aes_key(key)
-            self._device_sessions[dev_tok] = {"session_key": key}
+            self._token_keys[tok] = session_key
+            self._aes_key(session_key)
 
             if self._connect_callback:
                 self._connect_callback()
             asyncio.create_task(self.broadcast(
-                {"type": "sys", "text": "Remote connection established via QR code."}
+                {"type": "sys", "text": "KIRA Remote connected via QR code and phone paired."}
             ))
 
             return HTMLResponse(f"""<!DOCTYPE html>
@@ -539,11 +768,11 @@ class DashboardServer:
 <body>
 <script>
   sessionStorage.setItem('jarvis_token','{tok}');
-  sessionStorage.setItem('jarvis_key','{key}');
+  sessionStorage.setItem('jarvis_key','{session_key}');
   localStorage.setItem('jarvis_device_token','{dev_tok}');
   setTimeout(function(){{location.replace('/')}},400);
 </script>
-<p>Connecting to JARVIS…</p>
+<p>Connecting to KIRA…</p>
 </body></html>""")
 
         @app.post("/api/device-login")
@@ -554,9 +783,12 @@ class DashboardServer:
             except Exception:
                 return JSONResponse({"ok": False}, status_code=400)
             dev_tok = (body.get("device_token") or "").strip()
-            if not dev_tok or dev_tok not in self._device_sessions:
+            item = self._device_session(dev_tok) if dev_tok else None
+            if not item:
                 return JSONResponse({"ok": False}, status_code=401)
-            session_key = self._device_sessions[dev_tok]["session_key"]
+            session_key = str(item.get("session_key") or "")
+            if not session_key:
+                return JSONResponse({"ok": False}, status_code=401)
             tok = secrets.token_urlsafe(32)
             self._tokens.add(tok)
             self._token_keys[tok] = session_key
@@ -564,7 +796,7 @@ class DashboardServer:
             if self._connect_callback:
                 self._connect_callback()
             asyncio.create_task(self.broadcast(
-                {"type": "sys", "text": "Known device reconnected automatically."}
+                {"type": "sys", "text": "Paired iPhone reconnected automatically."}
             ))
             return JSONResponse({"ok": True, "token": tok, "key": session_key})
 
@@ -575,7 +807,21 @@ class DashboardServer:
                 return JSONResponse({"error": "Unauthorized"}, status_code=401)
             count = len(self._device_sessions)
             self._device_sessions.clear()
+            _save_device_store(self._device_sessions)
             return JSONResponse({"ok": True, "revoked": count})
+
+        @app.post("/api/unpair-device")
+        async def unpair_device(req: Request):
+            if not _auth(req):
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+            try:
+                body = await req.json()
+            except Exception:
+                body = {}
+            dev_tok = str(body.get("device_token") or "").strip()
+            if not dev_tok:
+                return JSONResponse({"ok": False, "error": "Missing device token"}, status_code=400)
+            return JSONResponse({"ok": self._unpair_device(dev_tok)})
 
         @app.post("/api/command")
         async def command(req: Request):
@@ -753,18 +999,8 @@ class DashboardServer:
     # ── serve ─────────────────────────────────────────────────────────────
 
     async def _serve_alias(self) -> None:
-        """Second HTTPS server on PORT+1 sharing the same app and in-memory state.
-        Chrome HTTPS-upgrades any bare IP:PORT the user types, so this port also needs TLS.
-        User types IP:8001 → Chrome tries https → self-signed cert warning → accept once → done."""
-        ssl_key  = BASE_DIR / "config" / "certs" / "jarvis.key"
-        ssl_cert = BASE_DIR / "config" / "certs" / "jarvis.crt"
-        asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT + 1)
-        cfg = uvicorn.Config(
-            self.app, host="0.0.0.0", port=PORT + 1, log_level="warning",
-            ssl_keyfile=str(ssl_key), ssl_certfile=str(ssl_cert),
-        )
-        print(f"[Dashboard] Manual entry:  {self._ip}:{PORT + 1}  (type in browser, accept cert once)")
-        await uvicorn.Server(cfg).serve()
+        """Legacy name retained; port 8001 is now the iPhone trust/setup portal."""
+        return
 
     async def serve(self) -> None:
         if not _DEPS_OK:
@@ -772,23 +1008,22 @@ class DashboardServer:
             print("[Dashboard] Run:  pip install fastapi 'uvicorn[standard]' cryptography")
             return
 
-        # Firewall setup runs in a thread — uvicorn starts immediately,
-        # no waiting for UAC dialogs or subprocess timeouts.
-        asyncio.get_event_loop().run_in_executor(None, _ensure_network_access, PORT)
+        loop = asyncio.get_event_loop()
+        loop.run_in_executor(None, _ensure_network_access, PORT)
 
-        use_ssl  = self._ssl_enabled()
-        ssl_key  = BASE_DIR / "config" / "certs" / "jarvis.key"
-        ssl_cert = BASE_DIR / "config" / "certs" / "jarvis.crt"
-
+        use_ssl = self._ssl_enabled()
         if use_ssl:
-            asyncio.create_task(self._serve_alias())
+            loop.run_in_executor(None, _ensure_network_access, SETUP_PORT)
+            _start_setup_server(self._ip)
 
         cfg = uvicorn.Config(
             self.app, host="0.0.0.0", port=PORT, log_level="warning",
-            **({"ssl_keyfile": str(ssl_key), "ssl_certfile": str(ssl_cert)} if use_ssl else {}),
+            **({"ssl_keyfile": str(SERVER_KEY), "ssl_certfile": str(SERVER_CERT)} if use_ssl else {}),
         )
 
         proto = "https" if use_ssl else "http"
         print(f"[Dashboard] {proto}://{self._ip}:{PORT}")
-        print("[Dashboard] Press 'Remote Control' in JARVIS UI to get the QR code.")
+        if use_ssl:
+            print(f"[Dashboard] iPhone trust/setup: http://{self._ip}:{SETUP_PORT}")
+        print("[Dashboard] Press 'Remote Control' in KIRA UI to pair or reconnect.")
         await uvicorn.Server(cfg).serve()

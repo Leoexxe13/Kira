@@ -1,3 +1,8 @@
+# KIRA_STARTUP_WARMTH
+# KIRA_V63_VOICE_RESILIENCE
+# KIRA_V62_STABILITY_PACK
+# KIRA_V6_BIG_UPGRADE
+# KIRA_V5_ASSISTANT_CORE
 import platform as _platform
 import subprocess as _subprocess
 
@@ -217,14 +222,19 @@ TOOL_DECLARATIONS = [
     {
         "name": "shutdown_jarvis",
         "description": (
-            "Shuts down the assistant completely. "
-            "Call this when the user expresses intent to end the conversation, "
-            "close the assistant, say goodbye, or stop Jarvis. "
-            "The user can say this in ANY language."
+            "Shuts down KIRA completely. ONLY call this when the user explicitly asks to "
+            "close, quit, stop, or shut down KIRA/JARVIS/the assistant itself. NEVER use it "
+            "to close WhatsApp, a browser, an app, a window, a chat, a website, or the camera."
         ),
         "parameters": {
             "type": "OBJECT",
-            "properties": {},
+            "properties": {
+                "target": {
+                    "type": "STRING",
+                    "description": "Must explicitly identify the assistant: kira | jarvis | assistant | asistente",
+                },
+            },
+            "required": ["target"],
         }
     },
     {
@@ -351,6 +361,7 @@ def _keep_context_of(exc: BaseException) -> bool:
 
 class JarvisLive:
     def __init__(self, ui: JarvisUI):
+        self._suppress_next_output_log_v2 = False
         self.ui             = ui
         self._asst_name     = "JARVI    S"   # updated each session from config
         self.session              = None
@@ -366,7 +377,7 @@ class JarvisLive:
         self._vision_last_time     = 0.0     # monotonic time of last screen_process call (cooldown guard)
         self._vision_busy          = False   # True while a vision capture/inject cycle is in flight
         self._interrupted          = False   # True while draining audio after user interrupt
-        self.ui.on_text_command   = self._on_text_command
+        self.ui.on_text_command   = self._route_text_command_v1
         self.ui.on_remote_clicked = self._make_remote_key
         self.ui.on_interrupt      = self.interrupt
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
@@ -608,7 +619,276 @@ class JarvisLive:
         manual = self._dashboard.get_manual_url()
         return url, key, f"{url}/auto-login?key={key}", manual
 
+    # KIRA_MULTI_API_ROUTER_V1
+    def _should_use_groq_v1(self, text: str) -> bool:
+        q = str(text or "").strip().lower()
+        if not q:
+            return False
+
+        if q.startswith("/groq "):
+            return True
+        if q.startswith("/gemini "):
+            return False
+
+        # Cualquier tarea que necesite herramientas, datos actuales o control del Mac
+        # se queda en Gemini Live.
+        gemini_cues = (
+            "investiga", "busca", "búscame", "buscame",
+            "internet", "web", "noticias", "hoy", "actual", "actualizado",
+            "feriado", "clima", "tiempo", "vuelo", "youtube", "spotify",
+            "abre ", "abrir ", "cierra ", "cerrar ", "crea ", "crear ",
+            "archivo", "carpeta", "descargas", "escritorio", "mueve ", "borra ",
+            "elimina ", "renombra ", "volumen", "brillo", "wifi",
+            "pendiente", "pendientes", "recuérdame", "recuerdame", "recordatorio",
+            "pantalla", "cámara", "camara", "correo", "mensaje", "terminal",
+        )
+        if any(x in q for x in gemini_cues):
+            return False
+
+        if len(q) < 8:
+            return False
+
+        # En FREE-FIRST, la conversación escrita general va a Groq.
+        return True
+
+
+    def _music_request_v62(self, raw: str):
+        import re
+        text=str(raw or '').strip(); low=text.lower()
+        action=any(x in low for x in ('pon ','ponme ','reproduce ','toca ','quiero escuchar','quiero oír','quiero oir'))
+        media=any(x in low for x in ('música','musica','canción','cancion','playlist','sonidos relajantes','lluvia relajante'))
+        if not (action and media): return None
+        q=re.sub(r'^(?:por favor\s+)?(?:ponme|pon|reproduce|toca)\s+(?:algo\s+de\s+)?','',text,flags=re.I).strip()
+        return q or 'música relajante'
+
+    async def _play_music_youtube_v62(self, query: str):
+        import asyncio
+        try:
+            from actions.youtube_video import _handle_play
+            self.ui.set_state('THINKING')
+            loop=asyncio.get_running_loop()
+            result=await loop.run_in_executor(None,lambda:_handle_play({'query':query},self.ui))
+            low=str(result or '').lower(); ok=low.startswith('playing:') or low.startswith('opened youtube search')
+            answer=f'Listo. Puse {query} en YouTube.' if ok else 'No pude iniciar la música en YouTube.'
+            self.ui.write_log(f'KIRA: {answer}')
+            await self._kira_voice_relay_v3(answer)
+            self.ui.set_state('LISTENING')
+        except Exception as e:
+            self.ui.write_log(f'ERR: YouTube // {e}')
+            try: await self._kira_voice_relay_v3('No pude iniciar la música en YouTube.')
+            except Exception: pass
+            self.ui.set_state('LISTENING')
+
+    def _route_text_command_v1(self, text: str):
+        import importlib.util
+        raw=str(text or '').strip()
+        if not raw:return
+        low=raw.lower()
+        # KIRA_V63_VOICE_STATUS
+        if low in ("/voz", "/voice"):
+            try:
+                from core.voice_manager import load_config
+                _vc = load_config()
+                _edge = "listo" if importlib.util.find_spec("edge_tts") else "no instalado"
+                answer = (
+                    f"Voz principal Gemini Live. Respaldo Edge {_edge}. "
+                    f"Edge {_vc.get('edge_voice')} a {_vc.get('edge_rate')}. "
+                    f"Reposo de micrófono tras {int(_vc.get('idle_mic_after_seconds',180))} segundos."
+                )
+            except Exception as e:
+                answer = f"No pude leer el estado de voz: {e}"
+            self.ui.write_log(f"KIRA: {answer}")
+            if self._loop:
+                import asyncio
+                asyncio.run_coroutine_threadsafe(self._kira_voice_relay_v3(answer), self._loop)
+            return
+        if low=='/usoapi':
+            try:
+                from core.api_usage import text as usage_text; answer=usage_text()
+            except Exception: answer='No pude leer el contador de uso.'
+            self.ui.write_log(f'KIRA: {answer}')
+            if self._loop:
+                import asyncio; asyncio.run_coroutine_threadsafe(self._kira_voice_relay_v3(answer),self._loop)
+            return
+        if low in ('/habilidades','habilidades','qué habilidades tienes','que habilidades tienes'):
+            try:
+                from core.skills_registry import text as skills_text; answer=skills_text()
+            except Exception: answer='No pude leer el registro de habilidades.'
+            self.ui.write_log(f'KIRA: {answer}')
+            if self._loop:
+                import asyncio; asyncio.run_coroutine_threadsafe(self._kira_voice_relay_v3(answer),self._loop)
+            return
+        q=self._music_request_v62(raw)
+        if q:
+            if self._loop:
+                import asyncio; asyncio.run_coroutine_threadsafe(self._play_music_youtube_v62(q),self._loop)
+            return
+        if low.startswith('/gemini '):
+            try:
+                from core.api_usage import record; record('gemini')
+            except Exception:pass
+            return self._on_text_command(raw[8:].strip())
+        if low=='/provider':
+            try:
+                from core.provider_manager import ProviderManager
+                from core.api_usage import text as usage_text
+                st=ProviderManager().status(); answer=f"Gemini Live: {'activo' if st.get('gemini_live') else 'apagado'}. Groq: {'listo' if st.get('groq') else 'sin configurar'}. "+usage_text()
+            except Exception as e:answer=f'No pude leer los proveedores: {e}'
+            self.ui.write_log(f'KIRA: {answer}'); return
+        try:
+            from core.local_fastpath import handle; res=handle(raw)
+        except Exception as e:
+            res=None; self.ui.write_log(f'ERR: local // {e}')
+        if res is not None and getattr(res,'handled',False):
+            try:
+                from core.api_usage import record; record('local',getattr(res,'ok',True))
+            except Exception:pass
+            if getattr(res,'activity',''):self.ui.write_log(f'SYS: {res.activity}')
+            if getattr(res,'text',''):self.ui.write_log(f'KIRA: {res.text}')
+            speech=str(getattr(res,'speak','') or '').strip()
+            if speech and self._loop:
+                import asyncio; asyncio.run_coroutine_threadsafe(self._kira_voice_relay_v3(speech),self._loop)
+            return
+        if self._should_use_groq_v1(raw):
+            try:
+                from core.api_usage import record; record('groq')
+            except Exception:pass
+            prompt=raw[6:].strip() if low.startswith('/groq ') else raw
+            if self._loop:
+                import asyncio; asyncio.run_coroutine_threadsafe(self._ask_groq_and_speak_v1(prompt),self._loop)
+            else:self._on_text_command(raw)
+            return
+        try:
+            from core.api_usage import record; record('gemini')
+        except Exception:pass
+        return self._on_text_command(raw)
+
+
+    async def _ask_groq_and_speak_v1(self,prompt:str):
+        import asyncio,re,time
+        from core.provider_manager import ProviderManager
+        try:
+            pm=ProviderManager()
+            if not pm.status().get("groq"):
+                self.ui.write_log("SYS: Groq no está disponible; usando Gemini."); return self._on_text_command(prompt)
+            self.ui.set_state("THINKING")
+            q=str(prompt).lower(); detail=any(x in q for x in ("detall","profund","completo","paso a paso","desarrolla","amplía","amplia"))
+            style="El usuario pidió detalle. Explica con claridad sin repetir." if detail else "Responde como una persona normal: 1 a 3 frases cortas, idealmente menos de 55 palabras."
+            start=time.perf_counter(); loop=asyncio.get_running_loop()
+            result=await loop.run_in_executor(None,lambda:pm.ask_free(prompt,system="Eres KIRA, una asistente personal. Responde siempre en español salvo que el usuario pida otro idioma. "+style+" No uses emojis, títulos markdown ni símbolos decorativos. Evita listas salvo que sean necesarias. Sé natural y directa."))
+            ms=int((time.perf_counter()-start)*1000)
+            if not result.ok:
+                self.ui.write_log(f"SYS: Groq falló; usando Gemini. {result.error[:100]}"); return self._on_text_command(prompt)
+            answer=re.sub(r'^[#>*•\-\s]+','',str(result.text or "").strip())
+            self.ui.write_log(f"KIRA: {answer}"); self.ui.write_log(f"SYS: Groq // {ms} ms")
+            await self._kira_voice_relay_v3(answer); self.ui.set_state("LISTENING")
+        except Exception as e:
+            self._suppress_next_output_log_v2=False; self.ui.write_log(f"ERR: router Groq — {e}"); self._on_text_command(prompt)
+
+    async def _kira_voice_relay_v3(self, text: str):
+        import asyncio
+        speech = str(text or "").strip()
+        if not speech or getattr(self.ui, "muted", False):
+            return
+
+        try:
+            from core.voice_manager import VoiceManager, load_config
+            if not hasattr(self, "_kira_voice_manager_v63"):
+                self._kira_voice_manager_v63 = VoiceManager(logger=self.ui.write_log)
+            vm = self._kira_voice_manager_v63
+            vcfg = load_config()
+        except Exception:
+            vm = None
+            vcfg = {"gemini_start_timeout_seconds": 2.8}
+
+        async def edge(reason: str):
+            if vm is None:
+                return False
+            try:
+                return await vm.speak_edge(speech, reason=reason)
+            except Exception as e:
+                self.ui.write_log(f"ERR: voz Edge // {e}")
+                return False
+
+        if not self.session:
+            await edge("Gemini sin sesión")
+            return
+
+        for _ in range(25):
+            try:
+                with self._speaking_lock:
+                    busy = bool(self._is_speaking)
+            except Exception:
+                busy = False
+            if not busy:
+                break
+            await asyncio.sleep(0.08)
+
+        try:
+            if self.audio_in_queue and not getattr(self, "_is_speaking", False):
+                while True:
+                    self.audio_in_queue.get_nowait()
+        except Exception:
+            pass
+
+        seq = int(getattr(self, "_kira_voice_relay_seq_v63", 0)) + 1
+        self._kira_voice_relay_seq_v63 = seq
+        self._kira_voice_relay_waiting_seq_v63 = seq
+        self._kira_voice_audio_seen_seq_v63 = 0
+        self._kira_suppress_live_audio_v63 = False
+        self._suppress_next_output_log_v2 = True
+
+        if self._turn_done_event:
+            self._turn_done_event.clear()
+
+        instruction = (
+            "Solo voz. Di exactamente el siguiente mensaje de forma natural en el mismo idioma. "
+            "No agregues información. No leas markdown, emojis, símbolos ni enlaces literalmente:\n\n"
+            + speech[:2200]
+        )
+
+        try:
+            await self.session.send_client_content(
+                turns={"role": "user", "parts": [{"text": instruction}]},
+                turn_complete=True,
+            )
+        except Exception as e:
+            self.ui.write_log(f"ERR: Gemini voz // {e}")
+            await edge("fallo al enviar a Gemini")
+            return
+
+        timeout = float(vcfg.get("gemini_start_timeout_seconds", 2.8) or 2.8)
+        end = asyncio.get_running_loop().time() + max(1.2, timeout)
+        while asyncio.get_running_loop().time() < end:
+            if int(getattr(self, "_kira_voice_audio_seen_seq_v63", 0)) >= seq:
+                return
+            await asyncio.sleep(0.08)
+
+        # Gemini no empezó a tiempo: Edge toma el turno y el audio tardío se descarta.
+        self._kira_suppress_live_audio_v63 = True
+        self._interrupted = True
+        try:
+            while True:
+                self.audio_in_queue.get_nowait()
+        except Exception:
+            pass
+        ok = await edge("Gemini tardó en hablar")
+        if not ok:
+            self.ui.write_log("ERR: voz // Gemini tardó y Edge no pudo reproducir")
+
     def _on_text_command(self, text: str):
+        # KIRA_FAST_FEEDBACK_V4
+        try:
+            _q = str(text).lower()
+            _slow = (
+                "investiga", "busca", "búscame", "buscame",
+                "feriado", "noticias", "actual", "hoy", "web", "internet"
+            )
+            if any(x in _q for x in _slow):
+                self.ui.write_log("KIRA: Buscando y verificando…")
+                self.ui.set_state("THINKING")
+        except Exception:
+            pass
         if not self._loop or not self.session:
             return
         # Respect wake-word sleep: a typed command must not be answered while
@@ -636,6 +916,13 @@ class JarvisLive:
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
+        # KIRA_V63_STOP_EDGE
+        try:
+            _vm = getattr(self, '_kira_voice_manager_v63', None)
+            if _vm is not None:
+                _vm.stop_now()
+        except Exception:
+            pass
         q = self.audio_in_queue
         if q:
             drained = 0
@@ -846,21 +1133,30 @@ class JarvisLive:
                     result = "Specify action (add/remove/list) and a topic."
 
             elif name == "shutdown_jarvis":
-                self.ui.write_log("SYS: Shutdown requested.")
-                async def _do_shutdown():
-                    await self._save_session_summary()
-                    if self.session:
-                        try:
-                            await self.session.send_client_content(
-                                turns={"role": "user", "parts": [{"text": "Say a brief natural goodbye to the user."}]},
-                                turn_complete=True,
-                            )
-                        except Exception:
-                            pass
-                    await asyncio.sleep(1.5)
-                    import os as _os
-                    _os._exit(0)
-                asyncio.create_task(_do_shutdown())
+                _shutdown_target = str(args.get("target", "") or "").lower().strip()
+                if _shutdown_target not in {"kira", "jarvis", "assistant", "asistente"}:
+                    result = (
+                        "Shutdown blocked. The user did not explicitly target KIRA/JARVIS. "
+                        "Use the specific app/tool close action instead."
+                    )
+                    self.ui.write_log("SYS: Shutdown blocked — target was not KIRA.")
+                else:
+                    self.ui.write_log("SYS: Shutdown requested explicitly for KIRA.")
+                    result = "KIRA shutdown scheduled."
+                    async def _do_shutdown():
+                        await self._save_session_summary()
+                        if self.session:
+                            try:
+                                await self.session.send_client_content(
+                                    turns={"role": "user", "parts": [{"text": "Say a brief natural goodbye to the user."}]},
+                                    turn_complete=True,
+                                )
+                            except Exception:
+                                pass
+                        await asyncio.sleep(1.5)
+                        import os as _os
+                        _os._exit(0)
+                    asyncio.create_task(_do_shutdown())
 
             elif self._action_registry.has(name):
                 # file_processor: fall back to the currently-uploaded file when none is given
@@ -898,6 +1194,11 @@ class JarvisLive:
             self.ui.set_state("LISTENING")
 
         print(f"[JARVIS] 📤 {name} → {str(result)[:80]}")
+        if name not in ("save_memory", "screen_process", "shutdown_jarvis"):
+            self._kira_tool_voice_seq = getattr(self, "_kira_tool_voice_seq", 0) + 1
+            self._kira_last_tool_name = name
+            self._kira_last_tool_result = str(result)
+
         return types.FunctionResponse(
             id=fc.id, name=name,
             response={"result": result}
@@ -922,6 +1223,19 @@ class JarvisLive:
         print("[JARVIS] 🎤 Mic started")
         loop = asyncio.get_event_loop()
 
+        # KIRA_V63_IDLE_MIC_GATE
+        from collections import deque
+        try:
+            from core.voice_manager import load_config as _load_voice_cfg_v63
+            _voice_cfg_v63 = _load_voice_cfg_v63()
+        except Exception:
+            _voice_cfg_v63 = {}
+        _idle_after_v63 = float(_voice_cfg_v63.get("idle_mic_after_seconds", 180) or 180)
+        _wake_level_v63 = float(_voice_cfg_v63.get("idle_wake_level", 0.055) or 0.055)
+        _pre_roll_v63 = deque(maxlen=8)
+        self._kira_last_mic_activity_v63 = time.monotonic()
+        self._kira_mic_idle_v63 = False
+
         def callback(indata, frames, time_info, status):
             # ── Wake-word gate ───────────────────────────────────────────────
             # While asleep, the mic audio NEVER goes to Gemini (nothing is
@@ -937,8 +1251,36 @@ class JarvisLive:
                 return
             with self._speaking_lock:
                 jarvis_speaking = self._is_speaking
+
+            data = indata.tobytes()
+            _pre_roll_v63.append(data)
+
+            if not self._wake_enabled and not self._phone_active and not jarvis_speaking:
+                _now_v63 = time.monotonic()
+                _level_v63 = _pcm_level(indata)
+                if _level_v63 >= _wake_level_v63:
+                    self._kira_last_mic_activity_v63 = _now_v63
+
+                if self._kira_mic_idle_v63:
+                    if _level_v63 >= _wake_level_v63 and not self.ui.muted:
+                        self._kira_mic_idle_v63 = False
+                        for _chunk_v63 in list(_pre_roll_v63):
+                            try:
+                                loop.call_soon_threadsafe(
+                                    self.out_queue.put_nowait,
+                                    {"data": _chunk_v63, "mime_type": "audio/pcm"}
+                                )
+                            except Exception:
+                                pass
+                        _pre_roll_v63.clear()
+                    return
+
+                if (_now_v63 - self._kira_last_mic_activity_v63) >= _idle_after_v63:
+                    self._kira_mic_idle_v63 = True
+                    print("[KIRA] Mic idle gate activo — escucha local, sin enviar silencio")
+                    return
+
             if not jarvis_speaking and not self.ui.muted and not self._phone_active:
-                data = indata.tobytes()
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
                     {"data": data, "mime_type": "audio/pcm"}
@@ -993,6 +1335,20 @@ class JarvisLive:
             print(f"[JARVIS] ❌ Mic: {e}")
             raise
 
+    async def _ensure_tool_voice_v62(self, seq: int):
+        import asyncio
+        await asyncio.sleep(2.6)
+        if seq != getattr(self,'_kira_tool_voice_seq',0):return
+        if getattr(self,'_kira_tool_voice_confirmed_seq',0)>=seq:return
+        name=str(getattr(self,'_kira_last_tool_name','') or '')
+        result=str(getattr(self,'_kira_last_tool_result','') or '').strip()
+        if not result or name in ('save_memory','screen_process','shutdown_jarvis') or result.startswith('[VISION_ACTIVE]'):return
+        try:
+            if self._turn_done_event:self._turn_done_event.clear()
+            await self.session.send_client_content(turns={'role':'user','parts':[{'text':'RESPUESTA DE RESPALDO DE HERRAMIENTA. No llames herramientas. En UNA frase corta en español, comunica únicamente lo que confirma este resultado. Si hay error o incertidumbre, dilo. No inventes éxito.\n\nHerramienta: '+name+'\nResultado: '+result[:1200]}]},turn_complete=True)
+            self.ui.write_log('SYS: voz // respaldo de herramienta')
+        except Exception as e:self.ui.write_log(f'ERR: voz herramienta // {e}')
+
     async def _receive_audio(self):
         print("[JARVIS] 👂 Recv started")
         out_buf, in_buf = [], []
@@ -1015,7 +1371,12 @@ class JarvisLive:
                             self._resume_handle = _sru.new_handle
 
                     if response.data:
-                        if self._interrupted:
+                        self._kira_direct_turn_had_audio_v63 = True
+                        _vseq = int(getattr(self, '_kira_voice_relay_waiting_seq_v63', 0))
+                        if _vseq:
+                            self._kira_voice_audio_seen_seq_v63 = _vseq
+                        self._kira_tool_voice_confirmed_seq = getattr(self, "_kira_tool_voice_seq", 0)
+                        if self._interrupted or getattr(self, "_kira_suppress_live_audio_v63", False):
                             pass  # discard: interrupted
                         else:
                             if self._turn_done_event and self._turn_done_event.is_set():
@@ -1049,6 +1410,9 @@ class JarvisLive:
                             # flag and skip all further processing for that turn.
                             if self._interrupted:
                                 self._interrupted = False
+                                self._kira_suppress_live_audio_v63 = False  # V63 TURN END
+                                self._kira_voice_relay_waiting_seq_v63 = 0
+                                self._kira_direct_turn_had_audio_v63 = False
                                 in_buf  = []
                                 out_buf = []
                                 continue
@@ -1066,6 +1430,26 @@ class JarvisLive:
                             in_buf = []
 
                             full_out = " ".join(out_buf).strip()
+                            # KIRA_V62_SUPPRESS_RELAY_TRANSCRIPT
+                            _relay_hidden = bool(getattr(self, "_suppress_next_output_log_v2", False))
+                            if _relay_hidden:
+                                self._suppress_next_output_log_v2 = False
+                                full_out = ""
+                            # KIRA_V63_TEXT_ONLY_EDGE_FALLBACK
+                            _had_audio_v63 = bool(getattr(self, "_kira_direct_turn_had_audio_v63", False))
+                            if full_out and not _had_audio_v63 and not _relay_hidden:
+                                try:
+                                    from core.voice_manager import VoiceManager
+                                    if not hasattr(self, "_kira_voice_manager_v63"):
+                                        self._kira_voice_manager_v63 = VoiceManager(logger=self.ui.write_log)
+                                    asyncio.create_task(
+                                        self._kira_voice_manager_v63.speak_edge(
+                                            full_out, reason="Gemini devolvió texto sin audio"
+                                        )
+                                    )
+                                except Exception as _ve:
+                                    self.ui.write_log(f"ERR: fallback texto/voz // {_ve}")
+                            self._kira_direct_turn_had_audio_v63 = False
                             if full_out:
                                 self.ui.write_log(f"{self._asst_name}: {full_out}")
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
@@ -1117,13 +1501,24 @@ class JarvisLive:
                         await self.session.send_tool_response(
                             function_responses=fn_responses
                         )
+                        _seq = getattr(self, "_kira_tool_voice_seq", 0)
+                        if _seq:
+                            asyncio.create_task(self._ensure_tool_voice_v62(_seq))
         except Exception as e:
             print(f"[JARVIS] ❌ Recv: {e}")
             traceback.print_exc()
             raise
 
     async def _play_audio(self):
+        """
+        KIRA voice playback with a small jitter buffer and a dedicated writer
+        thread. Gemini Live often delivers PCM in bursts; starting playback on
+        the first tiny packet makes longer replies sound chopped when the
+        network pauses for a few milliseconds.
+        """
         print("[JARVIS] 🔊 Play started")
+
+        import concurrent.futures
 
         _spk_name = get_output_device()
         _spk_dev  = audio_devices.resolve(_spk_name, "output")
@@ -1144,14 +1539,27 @@ class JarvisLive:
         try:
             stream = _open_spk(_spk_dev)
         except Exception as _e:
-            # A chosen output that the host API accepts by name but refuses to
-            # open (exclusive mode, wrong sample rate, device asleep) must not
-            # cost the user their voice. Fall back to the default and say so.
             if _spk_dev is None:
                 raise
             print(f"[JARVIS] ⚠️  Output device '{_spk_name}' failed: {_e} — using default")
-            self.ui.write_log(f"SYS: Speaker '{_spk_name}' unavailable — using system default.")
+            self.ui.write_log(
+                f"SYS: Speaker '{_spk_name}' unavailable — using system default."
+            )
             stream = _open_spk(None)
+
+        # One private worker for audio writes. This prevents unrelated asyncio
+        # jobs from competing with speech in Python's shared thread pool.
+        _writer = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="kira-audio"
+        )
+
+        # 24 kHz, 16-bit mono = 48,000 bytes/sec.
+        # ~300 ms gives enough cushion for normal Gemini/network burstiness
+        # without making KIRA feel sluggish.
+        _PREBUFFER_BYTES = 14400
+        # ~300 ms per hardware write: fewer scheduling boundaries than the old
+        # 200 ms path, while keeping interrupt latency reasonable.
+        _WRITE_BYTES = 14400
 
         try:
             while True:
@@ -1170,164 +1578,233 @@ class JarvisLive:
                         self._turn_done_event.clear()
                     continue
 
-                self.set_speaking(True)
-
-                # Batch all immediately-available chunks into one write to reduce
-                # thread-pool round-trips (was one asyncio.to_thread per 50ms slice).
-                # Cap at ~200 ms so interrupt() still stops audio within ~200 ms.
+                # New utterance: do not start from the first 50 ms packet.
+                # Build a small jitter cushion while Gemini keeps filling the
+                # queue in _receive_audio().
+                starting = not bool(getattr(self, "_is_speaking", False))
                 batch = bytearray(chunk)
-                while len(batch) < 9600:   # 9600 bytes ≈ 200 ms at 24 kHz / 16-bit mono
+
+                if starting:
+                    deadline = asyncio.get_running_loop().time() + 0.34
+                    while (
+                        len(batch) < _PREBUFFER_BYTES
+                        and asyncio.get_running_loop().time() < deadline
+                    ):
+                        try:
+                            more = await asyncio.wait_for(
+                                self.audio_in_queue.get(),
+                                timeout=0.035
+                            )
+                            batch.extend(more)
+                        except asyncio.TimeoutError:
+                            # If Gemini already completed this tiny turn, speak
+                            # what we have instead of waiting for a full buffer.
+                            if self._turn_done_event and self._turn_done_event.is_set():
+                                break
+
+                # Pull any data already waiting, up to a larger contiguous write.
+                while len(batch) < _WRITE_BYTES:
                     try:
                         batch.extend(self.audio_in_queue.get_nowait())
                     except asyncio.QueueEmpty:
                         break
 
-                # Drive the HUD waveform from JARVIS's own voice while speaking.
+                self.set_speaking(True)
+
                 try:
-                    self.ui.set_audio_level(_pcm_level(
-                        np.frombuffer(bytes(batch), dtype=np.int16)))
+                    self.ui.set_audio_level(
+                        _pcm_level(np.frombuffer(bytes(batch), dtype=np.int16))
+                    )
                 except Exception:
                     pass
 
                 try:
-                    await asyncio.to_thread(stream.write, bytes(batch))
-                except (RuntimeError, asyncio.CancelledError):
-                    break   # executor shutting down — exit cleanly
+                    loop = asyncio.get_running_loop()
+                    await loop.run_in_executor(_writer, stream.write, bytes(batch))
+                except asyncio.CancelledError:
+                    break
+                except RuntimeError:
+                    break
+                except Exception as _e:
+                    print(f"[JARVIS] ⚠️ Audio write: {_e}")
+                    break
+
         except Exception as e:
             print(f"[JARVIS] ❌ Play: {e}")
             raise
         finally:
             self.set_speaking(False)
-            stream.stop()
-            stream.close()
+            try:
+                _writer.shutdown(wait=False, cancel_futures=True)
+            except TypeError:
+                _writer.shutdown(wait=False)
+            try:
+                stream.stop()
+            except Exception:
+                pass
+            try:
+                stream.close()
+            except Exception:
+                pass
+
 
     # ── Morning briefing ────────────────────────────────────────────────────────
 
     async def _send_startup_briefing(self) -> None:
-        """
-        Two-phase briefing optimized for speed:
-          Phase 1 — instant greeting (no tools) → speech starts in <1s
-          Phase 2 — news pre-fetched in a background thread while Phase 1 plays,
-                    delivered as ready text (no Gemini tool-call round-trip) and
-                    shown on the UI content panel. Waits for turn_complete event
-                    instead of a fixed sleep so there is no unnecessary gap.
-        """
-        memory   = load_memory()
-        identity = memory.get("identity", {})
+        # KIRA_STARTUP_WARMTH
+        import asyncio
+        import json
+        from datetime import datetime
+        from pathlib import Path
 
-        def _val(k: str) -> str:
-            e = identity.get(k, {})
-            return (e.get("value", "") if isinstance(e, dict) else str(e)).strip()
+        for _ in range(60):
+            if self.session:
+                break
+            await asyncio.sleep(0.25)
 
-        lang = _val("language")
-        name = _val("name")
-        time_str = datetime.now().strftime("%H:%M")
-
-        # Start fetching news immediately — runs in parallel while phase 1 plays
-        loop = asyncio.get_event_loop()
-        news_future = loop.run_in_executor(None, _fetch_news_sync, "top world news today")
-
-        await asyncio.sleep(0.3)
         if not self.session:
+            self.ui.write_log("ERR: bienvenida inicial — la sesión de voz no estuvo lista.")
             return
 
-        # ── Phase 1: instant greeting ─────────────────────────────────────────
-        # The briefing fires before the user has said anything, so the
-        # remembered language is the only signal there is. It is a starting
-        # point, not a setting: the moment they reply, their language wins.
-        lang_clause = (f" Speak this greeting in {lang}, then follow the "
-                       f"user's own language from their first reply onward."
-                       if lang else "")
-        name_clause = f" Address the user as {name}." if name else ""
+        root = Path(__file__).resolve().parent
+        memory_dir = root / "memory"
+        memory_dir.mkdir(parents=True, exist_ok=True)
 
-        # Inject last session context if available — pop removes it so it's never repeated
-        last = await asyncio.to_thread(pop_last_session)
-        session_clause = ""
-        if last:
+        now = datetime.now()
+        hour = now.hour
+        daypart = "mañana" if hour < 12 else ("tarde" if hour < 19 else "noche")
+
+        pending = []
+        try:
+            p = memory_dir / "kira_tasks.json"
+            if p.exists():
+                items = json.loads(p.read_text(encoding="utf-8"))
+                pending = [x for x in items if isinstance(x, dict) and not x.get("done")]
+        except Exception:
+            pending = []
+
+        system_note = ""
+        try:
+            import psutil
+            cpu = int(psutil.cpu_percent(interval=None))
+            ram = int(psutil.virtual_memory().percent)
+            if cpu >= 90 and ram >= 92:
+                system_note = f"El Mac está bastante cargado ahora mismo: CPU {cpu}% y memoria {ram}%."
+            elif cpu >= 90:
+                system_note = f"El CPU está alto ahora mismo, cerca de {cpu}%."
+            elif ram >= 92:
+                system_note = f"La memoria está bastante alta ahora mismo, cerca de {ram}%."
+        except Exception:
+            pass
+
+        state_path = memory_dir / "kira_startup_state.json"
+        state = {}
+        try:
+            if state_path.exists():
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if not isinstance(state, dict):
+                    state = {}
+        except Exception:
+            state = {}
+
+        previous_iso = str(state.get("last_started_at") or "")
+        count = int(state.get("count") or 0) + 1
+        minutes_since = None
+
+        if previous_iso:
             try:
-                _delta = (datetime.now() - datetime.strptime(last["date"], "%Y-%m-%d")).days
-                _when  = "earlier today" if _delta == 0 else ("yesterday" if _delta == 1 else f"{_delta} days ago")
+                prev = datetime.fromisoformat(previous_iso)
+                minutes_since = max(0, int((now - prev).total_seconds() // 60))
             except Exception:
-                _when = "last time"
-            session_clause = (
-                f" Also briefly and naturally mention that {_when}: {last['summary']}"
+                minutes_since = None
+
+        try:
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "last_started_at": now.isoformat(timespec="seconds"),
+                        "count": count,
+                    },
+                    indent=2,
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
             )
+        except Exception:
+            pass
 
-        p1 = (
-            f"Greet the user warmly, mention it is {time_str}, and say you are fetching today's news now.{session_clause} "
-            f"Keep it to 2 short sentences max. Do not call any tools.{lang_clause}{name_clause}"
+        styles = (
+            "cálida, cercana y espontánea",
+            "tranquila, natural y ligeramente familiar",
+            "breve, despierta y con iniciativa",
+            "relajada y humana, sin sonar informal en exceso",
+            "serena, personal y nada ceremonial",
         )
+        style = styles[(count - 1) % len(styles)]
 
-        # Clear the turn-done event so we can wait for Phase 1 to finish
-        if self._turn_done_event:
-            self._turn_done_event.clear()
+        context = [
+            f"Es de {daypart}.",
+            f"Esta es la apertura número {count} registrada por la memoria de inicio.",
+        ]
 
-        await self.session.send_client_content(
-            turns={"role": "user", "parts": [{"text": p1}]},
-            turn_complete=True,
-        )
-        self.ui.write_log("SYS: Briefing phase 1 (greeting) sent.")
-
-        # ── Phase 2: fire as soon as Phase 1 audio is done ───────────────────
-        async def _deliver_news():
-            try:
-                lang_str = (f" Speak in {lang} unless the user has since "
-                            f"spoken another language, in which case use theirs."
-                            if lang else "")
-
-                # Wait for news fetch (already running) and Phase 1 turn-complete
-                # in parallel — whichever takes longer determines the wait time
-                news_done   = asyncio.wrap_future(news_future)
-                turn_waited = False
-                if self._turn_done_event:
-                    try:
-                        await asyncio.wait_for(self._turn_done_event.wait(), timeout=6.0)
-                        turn_waited = True
-                    except asyncio.TimeoutError:
-                        pass
-
-                # Extra buffer: turn_complete fires when Gemini finishes *generating*
-                # Phase 1, but audio may still be playing.  Waiting a beat here
-                # prevents Phase 2 audio from arriving while Phase 1 is mid-sentence
-                # (which sounds like a "repeated first response" to the user).
-                if turn_waited:
-                    await asyncio.sleep(0.8)
-                else:
-                    await asyncio.sleep(1.0)
-
-                try:
-                    news_text = await asyncio.wait_for(news_done, timeout=4.0)
-                except Exception:
-                    news_text = ""
-
-                if not self.session:
-                    return
-
-                if news_text and len(news_text) > 60:
-                    # Show on UI content panel immediately
-                    self.ui.show_content("NEWS — top world news today", news_text)
-
-                    p2 = (
-                        f"[BRIEFING] Here are today's top news headlines:\n{news_text}\n\n"
-                        "Pick ONE headline, summarise it in one sentence, then say the full list "
-                        f"is displayed on screen. Do not call any tools.{lang_str}"
-                    )
-                else:
-                    p2 = (
-                        "News headlines could not be fetched right now. "
-                        f"Let the user know briefly.{lang_str}"
-                    )
-
-                await self.session.send_client_content(
-                    turns={"role": "user", "parts": [{"text": p2}]},
-                    turn_complete=True,
+        if minutes_since is not None:
+            if minutes_since < 12:
+                context.append(
+                    "KIRA fue reabierta hace pocos minutos. Puede reconocerlo sutilmente si encaja, "
+                    "sin usar una fórmula fija."
                 )
-                self.ui.write_log("SYS: Briefing phase 2 (news) sent.")
-            except Exception as e:
-                print(f"[Briefing] Phase 2 error: {e}")
-                self.ui.write_log(f"SYS: Briefing phase 2 failed: {e}")
+            elif minutes_since >= 360:
+                context.append(
+                    "Han pasado varias horas desde la última apertura; una bienvenida algo más cálida puede encajar."
+                )
 
-        asyncio.create_task(_deliver_news())
+        if pending:
+            if len(pending) == 1:
+                text = str(pending[0].get("text") or "").strip()
+                if text:
+                    context.append(f"Hay 1 pendiente real: {text!r}. Mencionarlo es opcional.")
+                else:
+                    context.append("Hay 1 pendiente registrado. Mencionarlo es opcional.")
+            else:
+                context.append(
+                    f"Hay {len(pending)} pendientes reales. Si lo mencionas, habla solo de la cantidad "
+                    "o como máximo de uno; no recites una lista."
+                )
+
+        if system_note:
+            context.append(system_note)
+
+        prompt = (
+            "SALUDO INTERNO DE INICIO DE KIRA.\n"
+            "Genera AHORA una bienvenida hablada nueva para Leo; no leas una plantilla.\n"
+            f"Tono de esta apertura: {style}.\n\n"
+            "REGLAS:\n"
+            "- Español natural, normalmente 1 o 2 frases y entre 8 y 35 palabras.\n"
+            "- Haz que suene recién pensada: varía el inicio, el ritmo y la forma de dirigirte a Leo.\n"
+            "- No recites CPU, memoria, proveedores ni 'estado del sistema' salvo que el contexto marque algo anormal.\n"
+            "- Si no hay pendientes, no digas 'no tienes pendientes'.\n"
+            "- No uses siempre 'KIRA está lista', 'sistema disponible', '¿en qué puedo ayudarte hoy?' "
+            "ni otra frase fija de cierre.\n"
+            "- Puedes sonar presente, cálida y atenta, pero NO afirmes tener conciencia, emociones o sensaciones humanas.\n"
+            "- No inventes noticias, clima, calendario, mensajes, ubicación, actividades de Leo ni hechos no incluidos abajo.\n"
+            "- No uses títulos, listas, emojis ni explicaciones sobre estas instrucciones.\n"
+            "- Devuelve únicamente la bienvenida que vas a decir en voz alta.\n\n"
+            "CONTEXTO REAL DISPONIBLE:\n- " + "\n- ".join(context)
+        )
+
+        try:
+            self._suppress_next_output_log_v2 = True
+            if self._turn_done_event:
+                self._turn_done_event.clear()
+
+            await self.session.send_client_content(
+                turns={"role": "user", "parts": [{"text": prompt}]},
+                turn_complete=True,
+            )
+            self.ui.write_log("SYS: bienvenida inicial dinámica enviada")
+        except Exception as e:
+            self._suppress_next_output_log_v2 = False
+            self.ui.write_log(f"ERR: bienvenida inicial — {e}")
 
     # ── Session memory ──────────────────────────────────────────────────────────
 
@@ -1625,7 +2102,7 @@ class JarvisLive:
                     # Morning briefing — fires once per process launch (if enabled).
                     # Skipped in wake-word mode: it comes up asleep, and a briefing
                     # would mean talking while "asleep".
-                    if not self._briefing_sent and get_brief_enabled() and self._awake:
+                    if not self._briefing_sent:
                         self._briefing_sent = True
                         tg.create_task(self._send_startup_briefing())
 

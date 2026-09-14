@@ -1,0 +1,10 @@
+{
+  "mode": "gemini_primary_edge_fallback",
+  "edge_enabled": true,
+  "edge_voice": "es-MX-JorgeNeural",
+  "edge_rate": "+3%",
+  "edge_volume": "+0%",
+  "gemini_start_timeout_seconds": 2.8,
+  "idle_mic_after_seconds": 180,
+  "idle_wake_level": 0.055
+}

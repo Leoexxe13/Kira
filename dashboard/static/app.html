@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>JARVIS Dashboard</title>
+  <title>KIRA Remote</title>
   <script src="/static/crypto.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -50,6 +50,7 @@
     .enc-badge.on  { display: block; background: rgba(34,197,94,0.1); border: 1px solid rgba(34,197,94,0.25); color: var(--green); }
     .enc-badge.off { display: block; background: rgba(255,100,100,0.08); border: 1px solid rgba(255,100,100,0.2); color: #f87171; }
     .url { font-size: 10px; font-family: monospace; color: var(--muted); padding: 4px 9px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; }
+    .unlink { font-size:9px;color:var(--muted);background:transparent;border:1px solid var(--border);border-radius:6px;padding:5px 8px;cursor:pointer; }
 
     /* ── FEED ── */
     main { flex: 1; overflow-y: auto; padding: 14px 16px 8px; display: flex; flex-direction: column; gap: 10px; }
@@ -136,15 +137,15 @@
 <body>
   <div id="toast"></div>
   <header>
-    <div class="logo"><em>J</em>ARVIS</div>
+    <div class="logo">KIRA</div>
     <div class="pill" id="pill"><span class="dot"></span><span id="st">Connecting</span></div>
     <div class="enc-badge" id="enc">AES-256</div>
     <div class="spacer"></div>
-    <div class="url">__IP__:__PORT__</div>
+    <button class="unlink" onclick="doUnlink()" title="Desvincular este teléfono">UNLINK</button><div class="url">__IP__:__PORT__</div>
   </header>
   <main id="feed"></main>
   <footer>
-    <input id="inp" placeholder="Send a command to JARVIS…" autocomplete="off">
+    <input id="inp" placeholder="Escribe a KIRA…" autocomplete="off">
     <label class="btn-attach" for="file-inp" title="Send file">📎</label>
     <input type="file" id="file-inp" multiple accept="*/*" style="display:none">
     <button id="mic-btn" onclick="doMic()" title="Voice command">🎤</button>
@@ -154,8 +155,8 @@
 
   <script>
     // ── Auth — bearer token ───────────────────────────────────────────────────
-    const _authToken  = sessionStorage.getItem('jarvis_token');
-    const _sessionKey = sessionStorage.getItem('jarvis_key');
+    let _authToken  = sessionStorage.getItem('jarvis_token');
+    let _sessionKey = sessionStorage.getItem('jarvis_key');
 
     if (!_authToken) {
       location.replace('/login');
@@ -195,32 +196,143 @@
       } catch { return null; }
     }
 
-    const _encReady = _sessionKey ? _initCrypto(_sessionKey) : false;
+    let _encReady = _sessionKey ? _initCrypto(_sessionKey) : false;
     const encBadge  = document.getElementById('enc');
     if (_encReady) { encBadge.className = 'enc-badge on'; }
     else           { encBadge.className = 'enc-badge off'; encBadge.textContent = 'NO ENC'; }
 
-    // ── WebSocket ─────────────────────────────────────────────────────────────
+    // ── WebSocket with automatic reconnect ─────────────────────────────────
     const feed  = document.getElementById('feed');
     const pill  = document.getElementById('pill');
     const stTxt = document.getElementById('st');
     const wake  = document.getElementById('wake');
 
-    const _wsProto = location.protocol === 'https:' ? 'wss' : 'ws';
-    const _wsUrl   = `${_wsProto}://${location.host}/ws?token=${encodeURIComponent(_authToken)}`;
-    const ws       = new WebSocket(_wsUrl);
+    let _mainWs = null;
+    let _retryMs = 900;
+    let _reconnectTimer = null;
+    let _connectBusy = false;
+    let _sessionConfirmed = false;
 
-    ws.onopen    = () => { sys('Remote session active.'); toast('Connected to JARVIS'); };
-    ws.onclose   = () => sys('Connection lost — refresh to reconnect.');
-    ws.onerror   = () => sys('Connection error.');
-    ws.onmessage = (e) => {
-      const m = JSON.parse(e.data);
-      if (m.type === 'log')           append(m.speaker, m.text);
-      if (m.type === 'status')        setStatus(m.state);
-      if (m.type === 'wake')          sys('Wake word detected — connecting…');
-      if (m.type === 'sys')           sys(m.text);
-      if (m.type === 'file_received') _onFileReceived(m);
-    };
+    async function _renewSessionFromPairedPhone() {
+      const devTok = localStorage.getItem('jarvis_device_token');
+      if (!devTok) return 'missing';
+      try {
+        const r = await fetch('/api/device-login', {
+          method: 'POST',
+          headers: {'Content-Type':'application/json'},
+          body: JSON.stringify({device_token: devTok}),
+          cache: 'no-store'
+        });
+
+        // 401 means the server really no longer recognizes this paired phone.
+        // Network/server errors must NEVER erase the pairing.
+        if (r.status === 401) {
+          localStorage.removeItem('jarvis_device_token');
+          sessionStorage.removeItem('jarvis_token');
+          sessionStorage.removeItem('jarvis_key');
+          _authToken = null;
+          _sessionKey = null;
+          return 'invalid';
+        }
+        if (!r.ok) return 'retry';
+
+        const d = await r.json();
+        if (!(d.ok && d.token && d.key)) return 'retry';
+
+        _authToken = d.token;
+        _sessionKey = d.key;
+        sessionStorage.setItem('jarvis_token', d.token);
+        sessionStorage.setItem('jarvis_key', d.key);
+        _encReady = _initCrypto(d.key);
+        return 'ok';
+      } catch (_) {
+        // KIRA may simply still be booting. Keep the persistent device token.
+        return 'retry';
+      }
+    }
+
+    function _scheduleReconnect(delay = null) {
+      clearTimeout(_reconnectTimer);
+      const wait = delay === null ? _retryMs : delay;
+      _reconnectTimer = setTimeout(_connectMainWs, wait);
+      _retryMs = Math.min(8000, Math.round(_retryMs * 1.7));
+    }
+
+    async function _connectMainWs() {
+      clearTimeout(_reconnectTimer);
+      if (_connectBusy) return;
+      _connectBusy = true;
+
+      try {
+        const hasPairedPhone = !!localStorage.getItem('jarvis_device_token');
+
+        // Important after a KIRA/server restart:
+        // auth tokens live only in server RAM, while the paired-device token persists.
+        // Always exchange the persistent token for a fresh auth token before reconnecting.
+        if (hasPairedPhone && !_sessionConfirmed) {
+          stTxt.textContent = 'Reconnecting';
+          const renewed = await _renewSessionFromPairedPhone();
+
+          if (renewed === 'invalid') {
+            location.replace('/login');
+            return;
+          }
+          if (renewed !== 'ok') {
+            _scheduleReconnect();
+            return;
+          }
+        }
+
+        if (!_authToken) {
+          location.replace('/login');
+          return;
+        }
+
+        const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+        const url = `${proto}://${location.host}/ws?token=${encodeURIComponent(_authToken)}`;
+        const sock = new WebSocket(url);
+        _mainWs = sock;
+        stTxt.textContent = 'Connecting';
+
+        sock.onopen = () => {
+          _sessionConfirmed = true;
+          _retryMs = 900;
+          pill.className = 'pill on';
+          stTxt.textContent = 'Connected';
+          sys('KIRA Remote activa.');
+          toast('Conectado a KIRA');
+        };
+
+        sock.onmessage = (e) => {
+          const m = JSON.parse(e.data);
+          if (m.type === 'log')           append(m.speaker, m.text);
+          if (m.type === 'status')        setStatus(m.state);
+          if (m.type === 'wake')          sys('KIRA está despertando…');
+          if (m.type === 'sys')           sys(m.text);
+          if (m.type === 'file_received') _onFileReceived(m);
+        };
+
+        sock.onerror = () => {};
+
+        sock.onclose = () => {
+          if (_mainWs === sock) _mainWs = null;
+          _sessionConfirmed = false;
+          pill.className = 'pill';
+          stTxt.textContent = 'Reconnecting';
+
+          // Do not rely on WebSocket close code 4001 here. When ASGI rejects a
+          // socket before accept(), Safari may surface 1006 instead. The next
+          // attempt will refresh auth from the persistent paired-device token.
+          _scheduleReconnect();
+        };
+      } finally {
+        _connectBusy = false;
+      }
+    }
+
+    // On every page load/reload, a paired phone first obtains a fresh server
+    // session. This is what makes restart + Safari reload reconnect reliably.
+    _connectMainWs();
 
     function setStatus(s) {
       if (s === 'active') {
@@ -234,7 +346,7 @@
       const d = document.createElement('div');
       if (speaker === 'jarvis') {
         d.className = 'msg msg-j';
-        d.innerHTML = `<div class="lbl">Jarvis</div>${esc(text)}`;
+        d.innerHTML = `<div class="lbl">KIRA</div>${esc(text)}`;
       } else {
         d.className = 'msg msg-u';
         d.innerHTML = `<div class="lbl">You</div>${esc(text)}`;
@@ -371,6 +483,23 @@
       this.value = ''; // reset so the same file can be re-sent
     });
 
+    async function doUnlink() {
+      const devTok = localStorage.getItem('jarvis_device_token');
+      if (devTok) {
+        try {
+          await _authFetch('/api/unpair-device', {
+            method:'POST',
+            headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({device_token:devTok})
+          });
+        } catch (_) {}
+      }
+      localStorage.removeItem('jarvis_device_token');
+      sessionStorage.removeItem('jarvis_token');
+      sessionStorage.removeItem('jarvis_key');
+      location.replace('/login');
+    }
+
     // ── Commands ──────────────────────────────────────────────────────────────
     function doSend() {
       const inp = document.getElementById('inp');
@@ -414,7 +543,7 @@
 
     function _micIdle() {
       micBtn.innerHTML = '🎤';
-      micBtn.title     = 'Voice — tap to speak';
+      micBtn.title     = 'Voz — toca para hablar';
       micBtn.classList.remove('recording');
     }
 
@@ -435,38 +564,33 @@
     }
 
     function _showVoiceSetup() {
-      if (document.getElementById('voice-setup')) return; // show once
-      const origin = location.origin;
+      if (document.getElementById('voice-setup')) return;
+      const setupUrl = `http://${location.hostname}:8001`;
       const card = document.createElement('div');
       card.id = 'voice-setup';
       card.style.cssText = [
-        'align-self:stretch', 'background:rgba(99,102,241,0.07)',
-        'border:1px solid rgba(99,102,241,0.22)', 'border-radius:14px',
+        'align-self:stretch', 'background:rgba(255,255,255,0.04)',
+        'border:1px solid rgba(255,255,255,0.14)', 'border-radius:14px',
         'padding:16px 18px', 'font-size:13px', 'line-height:1.8',
         'animation:pop 0.18s ease'
       ].join(';');
       card.innerHTML =
-        '<div style="font-weight:700;color:#818cf8;letter-spacing:.5px;margin-bottom:10px">🎤 One-time voice setup</div>' +
-        '<ol style="padding-left:18px;color:#8899aa;margin:0;display:flex;flex-direction:column;gap:4px">' +
-        '<li>Open a new tab → go to <span style="background:rgba(255,255,255,0.07);padding:1px 6px;border-radius:4px;font-family:monospace;font-size:12px">chrome://flags</span></li>' +
-        '<li>Search: <strong style="color:#dde3ed">Insecure origins treated as secure</strong></li>' +
-        '<li>Paste this URL into the box:<br><span id="flags-url" style="background:rgba(255,255,255,0.07);padding:2px 8px;border-radius:4px;font-family:monospace;font-size:11px;user-select:all;cursor:pointer">' + esc(origin) + '</span></li>' +
-        '<li>Set to <strong style="color:#22c55e">Enabled</strong> → tap <strong style="color:#dde3ed">Relaunch</strong></li>' +
-        '<li>Return here and tap 🎤</li>' +
-        '</ol>';
+        '<div style="font-weight:700;color:#fff;letter-spacing:.5px;margin-bottom:10px">Micrófono del iPhone</div>' +
+        '<div style="color:#9aa3b2">iPhone exige una conexión HTTPS confiable para usar el micrófono.</div>' +
+        '<div style="margin-top:8px;color:#9aa3b2">Configuración única: abre <b style="color:#fff">' + esc(setupUrl) + '</b> en Safari, instala KIRA Local CA y activa la confianza del certificado. Luego vuelve a KIRA.</div>';
       feed.appendChild(card);
       feed.scrollTop = feed.scrollHeight;
-      // tap to copy
-      card.querySelector('#flags-url').addEventListener('click', () => {
-        navigator.clipboard?.writeText(origin).then(() => toast('URL copied!')).catch(() => {});
-      });
     }
 
     async function doMic() {
       if (_voiceWs) { _stopVoice(); return; }
 
-      if (!navigator.mediaDevices?.getUserMedia) {
+      if (!window.isSecureContext || location.protocol !== 'https:') {
         _showVoiceSetup();
+        return;
+      }
+      if (!navigator.mediaDevices?.getUserMedia) {
+        sys('Este navegador no expone el micrófono. En iPhone usa Safari.');
         return;
       }
       let stream;
@@ -476,8 +600,8 @@
         });
       } catch (e) {
         sys(e.name === 'NotAllowedError'
-          ? 'Microphone denied — tap the address bar lock and allow microphone.'
-          : 'Mic error: ' + e.message);
+          ? 'Micrófono bloqueado — en Safari abre Ajustes del sitio y permite Micrófono.'
+          : 'Error de micrófono: ' + e.message);
         return;
       }
 
@@ -530,14 +654,14 @@
         }
 
         micBtn.innerHTML = '⏹';
-        micBtn.title     = 'Tap to stop';
+        micBtn.title     = 'Toca para detener';
         micBtn.classList.add('recording');
-        sys('Voice live — speak now');
+        sys('Micrófono del iPhone activo — habla');
         toast('🎤 Live');
       };
 
       ws.onclose = () => { _stopVoice(); };
-      ws.onerror = () => { sys('Voice connection failed.'); _stopVoice(); };
+      ws.onerror = () => { sys('Falló la conexión del micrófono.'); _stopVoice(); };
 
       _voiceWs  = ws;
       _audioCtx = ctx;

@@ -5,12 +5,15 @@
 # never be.
 
 # ── Secrets. Committing any of these publishes them. ──────────────────────────
-config/api_keys.json          # your Gemini API key, plus per-plugin credentials
-config/certs/                 # the dashboard's TLS private key and certificate
-config/whatsapp_web/          # a LINKED WhatsApp session — committing it hands
-                              # somebody your WhatsApp account, not just a key
-**/token*.json                # Google OAuth tokens (Gmail / Calendar plugins)
-**/client_secret*.json        # Google OAuth client secrets
+# API credentials, local TLS material, and linked browser sessions.
+config/api_keys.json
+config/certs/
+config/whatsapp_web/
+.kira_whatsapp_profile/
+.jarvis_profiles/
+# OAuth tokens and client secrets.
+**/token*.json
+**/client_secret*.json
 *credentials*.json
 .env
 .env.*
@@ -18,6 +21,9 @@ config/whatsapp_web/          # a LINKED WhatsApp session — committing it hand
 # ── Personal data the assistant accumulates about you ─────────────────────────
 memory/long_term.json
 memory/*.db
+memory/kira_tasks.json
+memory/kira_startup_state.json
+config/dashboard_devices.json
 
 # ── Python build noise ────────────────────────────────────────────────────────
 __pycache__/
@@ -49,6 +55,13 @@ logs/
 downloads/
 screenshots/
 
-# KIRA local secrets and patch backups
-config/api_keys.json
-ui.py.pre_kira_*
+# Historical patch backups and one-time patch utilities.
+/backup_kira_*/
+*.pre_*
+/apply_kira_*.py
+/configure_kira_groq_free_sslfix.py
+/Desktop/
+
+config/providers.json
+config/autochat.json
+memory/api_usage.json

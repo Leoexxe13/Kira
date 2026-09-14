@@ -147,7 +147,7 @@ def _desktop_send(app_name: str, receiver: str, message: str) -> str:
     time.sleep(0.2)
     pyautogui.press("enter")
     time.sleep(0.3)
-    return f"Message sent to {receiver} via {app_name}."
+    return f"Mensaje enviado a {receiver} via {app_name}."
 
 def _send_whatsapp(receiver: str, message: str) -> str:
     return _desktop_send("WhatsApp", receiver, message)
@@ -188,7 +188,7 @@ def _send_instagram(receiver: str, message: str) -> str:
     pyautogui.press("enter")
     time.sleep(0.3)
 
-    return f"Message sent to {receiver} via Instagram."
+    return f"Mensaje enviado a {receiver} via Instagram."
 
 
 def _send_messenger(receiver: str, message: str) -> str:
@@ -210,7 +210,7 @@ def _send_messenger(receiver: str, message: str) -> str:
     pyautogui.press("enter")
     time.sleep(0.3)
 
-    return f"Message sent to {receiver} via Messenger."
+    return f"Mensaje enviado a {receiver} via Messenger."
 
 _PLATFORM_MAP = [
     ({"whatsapp", "wp", "wapp"},              _send_whatsapp),
@@ -242,9 +242,9 @@ def send_message(
     platform     = params.get("platform", "whatsapp").strip()
 
     if not receiver:
-        return "Please specify a recipient."
+        return "Especifica a quién quieres enviar el mensaje."
     if not message_text:
-        return "Please specify the message content."
+        return "Especifica el contenido del mensaje."
     if not _PYAUTOGUI:
         return "PyAutoGUI is not installed — cannot control the desktop."
 
@@ -257,7 +257,7 @@ def send_message(
         handler = _resolve_platform(platform)
         result  = handler(receiver, message_text)
     except Exception as e:
-        result = f"Could not send message: {e}"
+        result = f"No pude enviar el mensaje: {e}"
 
     print(f"[SendMessage] {'✅' if 'sent' in result.lower() else '❌'} {result}")
     if player:
@@ -294,3 +294,20 @@ TOOL = {
     },
     "handler": send_message,
 }
+
+# === KIRA_WHATSAPP_EXCLUSIVE_ROUTE_V2 ===
+try:
+    _KIRA_ORIGINAL_TOOL_HANDLER_V2 = TOOL.get("handler")
+except Exception:
+    _KIRA_ORIGINAL_TOOL_HANDLER_V2 = None
+if callable(_KIRA_ORIGINAL_TOOL_HANDLER_V2):
+    def _kira_whatsapp_route_guard_v2(*args, **kwargs):
+        params = args[0] if args and isinstance(args[0], dict) else kwargs.get("parameters", {})
+        params = params if isinstance(params, dict) else {}
+        joined = " ".join(str(v) for v in params.values()).lower()
+        action = str(params.get("action", "")).lower()
+        if "web.whatsapp.com" in joined or ("whatsapp" in joined and action in {"open","abrir","new_tab","navigate","go","send","message"}):
+            return "KIRA_ROUTE_BLOCKED: WhatsApp está reservado para whatsapp_web. No se abrió Safari, Chrome ni una app alternativa."
+        return _KIRA_ORIGINAL_TOOL_HANDLER_V2(*args, **kwargs)
+    TOOL["handler"] = _kira_whatsapp_route_guard_v2
+# === END_KIRA_WHATSAPP_EXCLUSIVE_ROUTE_V2 ===

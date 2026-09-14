@@ -149,19 +149,16 @@ def _get_videos() -> Path:
 
 
 def _resolve_path(raw: str) -> Path:
-    shortcuts: dict[str, Path] = {
-        "desktop":   _get_desktop(),
-        "downloads": _get_downloads(),
-        "documents": _get_documents(),
-        "pictures":  _get_pictures(),
-        "music":     _get_music(),
-        "videos":    _get_videos(),
-        "home":      Path.home(),
-    }
-    lower = raw.strip().lower()
-    if lower in shortcuts:
-        return shortcuts[lower]
-    return Path(raw).expanduser()
+    raw=str(raw or "").strip()
+    shortcuts={"desktop":_get_desktop(),"escritorio":_get_desktop(),"downloads":_get_downloads(),"descargas":_get_downloads(),"documents":_get_documents(),"documentos":_get_documents(),"pictures":_get_pictures(),"imagenes":_get_pictures(),"imágenes":_get_pictures(),"music":_get_music(),"música":_get_music(),"musica":_get_music(),"videos":_get_videos(),"home":Path.home(),"inicio":Path.home()}
+    if not raw:return Path.home()
+    p=Path(raw).expanduser()
+    if p.is_absolute():return p
+    parts=Path(raw).parts
+    if parts and str(parts[0]).lower() in shortcuts:
+        base=shortcuts[str(parts[0]).lower()]
+        return base.joinpath(*parts[1:]) if len(parts)>1 else base
+    return Path.home()/raw
 
 def _format_size(b: int) -> str:
     for unit in ["B", "KB", "MB", "GB", "TB"]:
@@ -215,24 +212,21 @@ def list_files(path: str = "desktop", show_hidden: bool = False) -> str:
 
 def create_file(path: str, name: str = "", content: str = "") -> str:
     try:
-        base   = _resolve_path(path)
-        target = (base / name) if name else base
-        if not _is_safe_path(target):
-            return f"Access denied: {target}"
-        target.parent.mkdir(parents=True, exist_ok=True)
-        existed = target.exists()
-        previous = None
+        base=_resolve_path(path); target=((base/name) if name else base).expanduser().resolve()
+        if not _is_safe_path(target):return f"Acceso denegado: {target}"
+        target.parent.mkdir(parents=True,exist_ok=True)
+        existed=target.exists(); previous=None
         if existed:
-            try:
-                previous = target.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                previous = None
-        target.write_text(content, encoding="utf-8")
-        push_undo(f"created {target.name}",
-                  _undo_write(target, previous) if existed else _undo_create(target))
-        return f"File created: {target.name}"
-    except Exception as e:
-        return f"Could not create file: {e}"
+            try:previous=target.read_text(encoding="utf-8",errors="ignore")
+            except Exception:previous=None
+        target.write_text(content,encoding="utf-8")
+        if not target.exists() or not target.is_file():return f"ERROR_VERIFICACION: no existe después de crear: {target}"
+        try:
+            if target.read_text(encoding="utf-8")!=content:return f"ERROR_VERIFICACION: contenido distinto en {target}"
+        except Exception as e:return f"ERROR_VERIFICACION: no pude releer {target}: {e}"
+        push_undo(f"created {target.name}",_undo_write(target,previous) if existed else _undo_create(target))
+        return f"VERIFICADO: archivo creado en {target}"
+    except Exception as e:return f"No pude crear el archivo: {e}"
 
 
 def create_folder(path: str, name: str = "") -> str:
@@ -400,41 +394,22 @@ def read_file(path: str, name: str = "", max_chars: int = 4000) -> str:
         return f"Could not read file: {e}"
 
 
-def write_file(path: str, name: str = "", content: str = "",
-               append: bool = False) -> str:
+def write_file(path: str, name: str = "", content: str = "", append: bool = False) -> str:
     try:
-        base   = _resolve_path(path)
-        target = (base / name) if name else base
-        if not _is_safe_path(target):
-            return f"Access denied: {target}"
-        target.parent.mkdir(parents=True, exist_ok=True)
-
-        # Snapshot before writing. None means "did not exist", which is a
-        # different undo (delete it) from "existed and had this in it".
-        previous: str | None = None
-        undoable = True
+        base=_resolve_path(path); target=((base/name) if name else base).expanduser().resolve()
+        if not _is_safe_path(target):return f"Acceso denegado: {target}"
+        previous=None
         if target.exists():
-            try:
-                if target.stat().st_size > _UNDO_CONTENT_LIMIT:
-                    undoable = False       # too large to hold in memory
-                else:
-                    previous = target.read_text(encoding="utf-8", errors="ignore")
-            except Exception:
-                undoable = False           # binary, locked, unreadable
-
-        mode = "a" if append else "w"
-        with open(target, mode, encoding="utf-8") as f:
-            f.write(content)
-
-        action = "Appended to" if append else "Written to"
-        if undoable:
-            push_undo(f"wrote to {target.name}", _undo_write(target, previous))
-            return f"{action}: {target.name}"
-        return (f"{action}: {target.name}. "
-                f"(Too large to keep a copy of the old contents, so this one "
-                f"cannot be undone.)")
-    except Exception as e:
-        return f"Could not write file: {e}"
+            try:previous=target.read_text(encoding="utf-8",errors="ignore")
+            except Exception:previous=None
+        target.parent.mkdir(parents=True,exist_ok=True)
+        with target.open("a" if append else "w",encoding="utf-8") as f:f.write(content)
+        if not target.exists() or not target.is_file():return f"ERROR_VERIFICACION: no existe después de escribir: {target}"
+        actual=target.read_text(encoding="utf-8")
+        if (append and content not in actual) or ((not append) and actual!=content):return f"ERROR_VERIFICACION: contenido no coincide en {target}"
+        push_undo(f"wrote {target.name}",_undo_write(target,previous))
+        return f"VERIFICADO: escrito correctamente en {target}"
+    except Exception as e:return f"No pude escribir el archivo: {e}"
 
 
 def find_files(name: str = "", extension: str = "",
