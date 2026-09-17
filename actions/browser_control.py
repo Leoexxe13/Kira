@@ -1137,6 +1137,8 @@ try:
 except Exception:
     _KIRA_ORIGINAL_TOOL_HANDLER_V2 = None
 if callable(_KIRA_ORIGINAL_TOOL_HANDLER_V2):
+    from functools import wraps
+    @wraps(_KIRA_ORIGINAL_TOOL_HANDLER_V2)
     def _kira_whatsapp_route_guard_v2(*args, **kwargs):
         params = args[0] if args and isinstance(args[0], dict) else kwargs.get("parameters", {})
         params = params if isinstance(params, dict) else {}

@@ -299,6 +299,12 @@ except Exception:
     _KIRA_ORIGINAL_TOOL_HANDLER_V2 = None
 if callable(_KIRA_ORIGINAL_TOOL_HANDLER_V2):
     def _kira_whatsapp_route_guard_v2(*args, **kwargs):
+        # The registry may supply optional runtime context; the original
+        # handler intentionally accepts only its declared arguments.
+        kwargs.pop("speak", None)
+        kwargs.pop("response", None)
+        kwargs.pop("player", None)
+        kwargs.pop("session_memory", None)
         params = args[0] if args and isinstance(args[0], dict) else kwargs.get("parameters", {})
         params = params if isinstance(params, dict) else {}
         joined = " ".join(str(v) for v in params.values()).lower()

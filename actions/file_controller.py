@@ -148,17 +148,9 @@ def _get_videos() -> Path:
     return Path.home() / "Videos"
 
 
-def _resolve_path(raw: str) -> Path:
-    raw=str(raw or "").strip()
-    shortcuts={"desktop":_get_desktop(),"escritorio":_get_desktop(),"downloads":_get_downloads(),"descargas":_get_downloads(),"documents":_get_documents(),"documentos":_get_documents(),"pictures":_get_pictures(),"imagenes":_get_pictures(),"imágenes":_get_pictures(),"music":_get_music(),"música":_get_music(),"musica":_get_music(),"videos":_get_videos(),"home":Path.home(),"inicio":Path.home()}
-    if not raw:return Path.home()
-    p=Path(raw).expanduser()
-    if p.is_absolute():return p
-    parts=Path(raw).parts
-    if parts and str(parts[0]).lower() in shortcuts:
-        base=shortcuts[str(parts[0]).lower()]
-        return base.joinpath(*parts[1:]) if len(parts)>1 else base
-    return Path.home()/raw
+from core.resource_resolver import resolve_path as _resolve_path
+from core.operational_context import CONTEXT
+
 
 def _format_size(b: int) -> str:
     for unit in ["B", "KB", "MB", "GB", "TB"]:
@@ -190,15 +182,19 @@ def list_files(path: str = "desktop", show_hidden: bool = False) -> str:
             return f"Not a directory: {target}"
 
         items = []
+        observed = []
         for item in sorted(target.iterdir()):
             if not show_hidden and item.name.startswith("."):
                 continue
+            observed.append(_file_observation(item))
             if item.is_dir():
                 items.append(f"📁 {item.name}/")
             else:
                 size = _format_size(item.stat().st_size)
                 items.append(f"📄 {item.name} ({size})")
 
+        CONTEXT.remember('last_folder',target)
+        CONTEXT.update(last_query_results=observed[:50])
         if not items:
             return f"Directory is empty: {target.name}/"
 
@@ -225,6 +221,7 @@ def create_file(path: str, name: str = "", content: str = "") -> str:
             if target.read_text(encoding="utf-8")!=content:return f"ERROR_VERIFICACION: contenido distinto en {target}"
         except Exception as e:return f"ERROR_VERIFICACION: no pude releer {target}: {e}"
         push_undo(f"created {target.name}",_undo_write(target,previous) if existed else _undo_create(target))
+        CONTEXT.resource(target, created=True)
         return f"VERIFICADO: archivo creado en {target}"
     except Exception as e:return f"No pude crear el archivo: {e}"
 
@@ -242,7 +239,9 @@ def create_folder(path: str, name: str = "") -> str:
         # directory the user has had for years.
         if not already:
             push_undo(f"created folder {target.name}", _undo_create(target))
-        return f"Folder created: {target.name}"
+        if not target.is_dir(): return f"ERROR_VERIFICACION: carpeta no encontrada: {target}"
+        CONTEXT.resource(target, created=True)
+        return f"VERIFICADO: carpeta {'reutilizada' if already else 'creada'} en {target.resolve()}"
     except Exception as e:
         return f"Could not create folder: {e}"
 
@@ -296,11 +295,14 @@ def move_file(path: str, name: str = "", destination: str = "") -> str:
             dst = dst / src.name
 
         dst.parent.mkdir(parents=True, exist_ok=True)
+        if dst.exists(): return f"No pude mover: el destino ya existe: {dst}"
         origin = src.resolve()
         shutil.move(str(src), str(dst))
         push_undo(f"moved {origin.name} to {dst.parent.name}/",
                   _undo_move(origin, dst.resolve()))
-        return f"Moved: {src.name} → {dst.parent.name}/"
+        if not dst.exists() or src.exists(): return f"ERROR_VERIFICACION: movimiento no confirmado: {dst}"
+        CONTEXT.resource(dst)
+        return f"VERIFICADO: movido a {dst.resolve()}"
 
     except Exception as e:
         return f"Could not move: {e}"
@@ -326,6 +328,7 @@ def copy_file(path: str, name: str = "", destination: str = "") -> str:
 
         dst.parent.mkdir(parents=True, exist_ok=True)
 
+        if dst.exists(): return f"No pude copiar: el destino ya existe: {dst}"
         if src.is_dir():
             shutil.copytree(str(src), str(dst))
         else:
@@ -343,7 +346,9 @@ def copy_file(path: str, name: str = "", destination: str = "") -> str:
             return f"Removed the copy in {_copy.parent.name}/."
         push_undo(f"copied {src.name} to {dst.parent.name}/", _undo_copy)
 
-        return f"Copied: {src.name} → {dst.parent.name}/"
+        if not dst.exists(): return f"ERROR_VERIFICACION: copia no encontrada: {dst}"
+        CONTEXT.resource(dst, created=True)
+        return f"VERIFICADO: copiado a {dst.resolve()}"
 
     except Exception as e:
         return f"Could not copy: {e}"
@@ -364,8 +369,11 @@ def rename_file(path: str, name: str = "", new_name: str = "") -> str:
         if new_path.exists():
             return f"A file named '{new_name}' already exists here."
 
+        if not _is_safe_path(new_path): return f"Access denied: {new_path}"
         old_path = target.resolve()
         target.rename(new_path)
+        if not new_path.exists() or target.exists(): return "ERROR_VERIFICACION: renombrado no confirmado"
+        CONTEXT.resource(new_path)
         push_undo(f"renamed {old_path.name} to {new_name}",
                   _undo_move(old_path, new_path.resolve()))
         return f"Renamed: {target.name} → {new_name}"
@@ -425,6 +433,7 @@ def find_files(name: str = "", extension: str = "",
         dir_count  = 0
         max_dirs   = 500  # performance + safety limit
 
+        found_paths = []
         for item in search_path.rglob("*"):
             if item.is_dir():
                 dir_count += 1
@@ -438,14 +447,17 @@ def find_files(name: str = "", extension: str = "",
             if name and name.lower() not in item.name.lower():
                 continue
             size = _format_size(item.stat().st_size)
-            results.append(f"📄 {item.name} ({size}) — {item.parent}")
+            found_paths.append(item.resolve())
+            results.append(f"📄 {item.resolve()} ({size})")
             if len(results) >= max_results:
                 break
 
+        CONTEXT.update(last_query_results=[_file_observation(p) for p in found_paths])
         if not results:
             query = name or extension or "files"
             return f"No {query} found in {search_path.name}/"
 
+        if len(found_paths) == 1: CONTEXT.resource(found_paths[0])
         return f"Found {len(results)} file(s):\n" + "\n".join(results)
 
     except Exception as e:
@@ -683,6 +695,63 @@ def file_controller(
         return f"File controller error ({action}): {e}"
 
 
+def _file_observation(path):
+    stat=path.stat()
+    return {'path':str(path.resolve()),'name':path.name,'extension':path.suffix.lower(),
+            'modified':stat.st_mtime,'size':stat.st_size,'is_dir':path.is_dir()}
+
+
+def structured_files(parameters, **_context):
+    """Actual filesystem observations, never reconstructed from prose."""
+    params = dict(parameters)
+    action = params['action']
+    required = {'move':('path','destination'), 'copy':('path','destination'),
+                'rename':('path','new_name'), 'delete':('path',), 'read':('path',),
+                'write':('path','content'), 'create_file':('path',), 'create_folder':('path',)}
+    if any(not params.get(key) for key in required.get(action,()) if key!='content'):
+        return {'state':'failed','text':'Faltan argumentos explícitos para esa operación.','data':None}
+    base = _resolve_path(params.get('path','desktop'))
+    target = (base / params['name']) if params.get('name') and action not in ('find','list') else base
+    if not _is_safe_path(target):
+        return {'state':'failed','text':'Acceso denegado a esa ruta.','data':None}
+    def item(path):
+        return _file_observation(path)
+    if action in ('list','find'):
+        if not base.is_dir(): return {'state':'failed','text':'La carpeta no existe.','data':None}
+        extension = params.get('extension','').lower()
+        name = params.get('name','').casefold()
+        candidates = base.iterdir() if action=='list' else base.rglob('*')
+        found = []
+        for scanned, path in enumerate(candidates):
+            if scanned>=10000: break
+            if path.name.startswith('.') or not _is_safe_path(path): continue
+            if extension and path.suffix.lower()!=extension: continue
+            if name and name not in path.name.casefold(): continue
+            found.append(item(path))
+            if len(found)>=500: break
+        found.sort(key=lambda r:r['modified'],reverse=True)
+        found = found[:50]
+        CONTEXT.remember('last_folder',base)
+        text = '\n'.join(r['name'] for r in found) or 'No encontré archivos con esos criterios.'
+        return {'state':'verified','text':text,'data':found,'context':{'last_folder':str(base)}}
+    if action in ('create_file','write') and target.exists():
+        return {'state':'failed','text':'El archivo ya existe; no lo sobrescribí.','data':None}
+    raw = file_controller(params)
+    from core.tool_feedback import classify_result
+    _, failed, _ = classify_result('file_controller',raw)
+    if failed: return {'state':'failed','text':raw,'data':None}
+    destination = target
+    if action in ('move','copy'):
+        destination = _resolve_path(params['destination'])
+        if destination.is_dir(): destination = destination / target.name
+    elif action=='rename': destination = target.with_name(params['new_name'])
+    verified = action in ('create_file','create_folder','move','copy','rename') and destination.exists()
+    if action=='move': verified = verified and not target.exists()
+    if action=='delete': verified = not target.exists()
+    data = item(destination) if destination.exists() else None
+    return {'state':'verified' if verified else 'executed','text':raw,'data':data,
+            'context':{'last_resource':str(destination), 'last_folder' if destination.is_dir() else 'last_file':str(destination)} if data else {}}
+
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "file_controller",
@@ -692,6 +761,7 @@ TOOL = {
         "properties": {
             "action": {
                 "type": "STRING",
+                "enum": ["list", "create_file", "create_folder", "delete", "move", "copy", "rename", "read", "write", "find", "largest", "disk_usage", "organize_desktop", "info"],
                 "description": "list | create_file | create_folder | delete | move | copy | rename | read | write | find | largest | disk_usage | organize_desktop | info"
             },
             "path": {
@@ -728,4 +798,6 @@ TOOL = {
         ]
     },
     "handler": file_controller,
+    "structured_handler": structured_files,
+    "safe_actions": ('list','find','read','info','disk_usage','create_folder','create_file','move','copy'),
 }

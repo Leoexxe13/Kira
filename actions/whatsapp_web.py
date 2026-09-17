@@ -342,6 +342,22 @@ class _WhatsAppWorker:
                 ))
                 by_id[c["id"]]["aliases"] = merged
 
+        # A unique exact normalized display name wins over fuzzy aliases.
+        # Duplicate IDs are one chat; homonyms with distinct IDs remain ambiguous.
+        for field in ("name", "aliases"):
+            exact = {}
+            for row in rows:
+                values = [row.get("name", "")] if field == "name" else row.get("aliases", [])
+                if row.get("id") and any(_norm(v) == _norm(wanted) for v in values):
+                    exact[row["id"]] = row
+            if exact:
+                options = [dict(name=r.get("name"), id=r["id"], score=1.0, matched_alias=wanted) for r in exact.values()]
+                if len(exact) == 1:
+                    best = dict(next(iter(exact.values())))
+                    best.update(match_score=1.0, matched_alias=wanted)
+                    return best, options
+                return None, options[:5]
+
         ranked = []
         for row in rows:
             aliases = row.get("aliases") or [row.get("name", "")]
@@ -361,6 +377,8 @@ class _WhatsAppWorker:
 
         ranked = list(dedup.values())
         ranked.sort(key=lambda x: (x[0], x[1].get("timestamp", 0)), reverse=True)
+        threshold = 0.82 if len(_tokens(wanted)) >= 2 else 0.76
+        ranked = [item for item in ranked if item[0] >= threshold]
 
         candidates = [
             {
@@ -381,10 +399,7 @@ class _WhatsAppWorker:
             return None, candidates
 
         if len(ranked) > 1:
-            second = ranked[1][0]
-            margin = 0.10 if multi else 0.08
-            if (best_score - second) < margin:
-                return None, candidates
+            return None, candidates
 
         best = dict(best)
         best["match_score"] = round(best_score, 3)
@@ -416,8 +431,14 @@ class _WhatsAppWorker:
             c["option"] = len(clean) + 1
             c["id_hint"] = hint
             c["kind"] = kind
+            # Candidate labels are user-facing; keep IDs only in the guarded
+            # payload for internal verification, never in chat prose.
+            c["label"] = f"{c['option']}. {c.get('name') or 'Sin nombre'}"
             clean.append(c)
 
+        for candidate in clean:
+            if sum(_norm(other.get('name', '')) == _norm(candidate.get('name', '')) for other in clean) > 1:
+                candidate['label'] += ' — ' + candidate['id_hint']
         self._last_candidates = clean
         self._last_candidate_query = str(query or "").strip()
         self._last_candidates_at = time.monotonic()
@@ -488,7 +509,7 @@ class _WhatsAppWorker:
                 numbered = self._remember_candidates(wanted, candidates)
                 return None, numbered, {
                     "ok": False,
-                    "reason": "Hay varias coincidencias o ninguna es suficientemente clara. Elige una opción; no repetiré la búsqueda por el mismo nombre.",
+                    "reason": "Elige un destinatario:\n" + '\n'.join(c['label'] for c in numbered) if numbered else "No encontré una coincidencia suficientemente clara; indica el nombre completo.",
                     "query": wanted,
                     "candidates": numbered,
                     "selection_supported": bool(numbered),
@@ -842,9 +863,21 @@ class _WhatsAppWorker:
         return result or {"ok": False, "error": "sendTextMessage no devolvió resultado."}
 
     def _dispatch(self, p):
+        p = dict(p)
         action = _norm(p.get("action", "open")).replace(" ", "_")
-        chat = str(p.get("chat", "") or "").strip()
-        message = str(p.get("message", "") or "").strip()
+        # Gemini occasionally uses a semantically equivalent field name when
+        # producing a tool call. Accept one alias only; conflicting values are
+        # rejected below instead of silently choosing a recipient.
+        chat_values = [p.get(key) for key in ("chat", "contact", "recipient", "nombre") if p.get(key) not in (None, "")]
+        if len({str(value).strip() for value in chat_values}) > 1:
+            return "WHATSAPP_UNVERIFIED: Los campos del destinatario se contradicen."
+        chat = str(chat_values[0] if chat_values else "").strip()
+        message_values = [p.get(key) for key in ("message", "text", "body") if p.get(key) not in (None, "")]
+        if len({str(value).strip() for value in message_values}) > 1:
+            return "WHATSAPP_UNVERIFIED: Los campos del mensaje se contradicen."
+        message = str(message_values[0] if message_values else "").strip()
+        if any(key in p for key in ('message','text','body')):
+            p['message'] = message  # aliases must undergo the pending-message guard too
         candidate_id = str(p.get("candidate_id", "") or "").strip()
         candidate_index = p.get("candidate_index", 0)
         direction = _norm(p.get("direction", "all"))
@@ -875,6 +908,13 @@ class _WhatsAppWorker:
         elif action in {"close","cerrar","salir","return","volver","back","regresar"}:
             action = "close"
 
+        # "open" with a named chat means open that chat, not merely launch the
+        # WhatsApp window. The latter remains available as action=open without
+        # a recipient. This protects natural orders such as "abre el chat de…"
+        # when the model omits the select synonym.
+        if action in {'open','abrir','show','mostrar'} and (chat or candidate_id or "candidate_index" in p):
+            action = "select"
+
         if action == "close":
             self._clear_candidates()
             # Close ONLY the dedicated WhatsApp Playwright window/context.
@@ -898,6 +938,11 @@ class _WhatsAppWorker:
                 "kira_remains_running": True
             })
 
+        # Search is observational while an actionable choice is pending. It may
+        # not rebind candidate indices to another recipient or reset the TTL.
+        preserve_search = (action == "search" and self._pending_operation is not None
+                           and self._last_candidates and self._pending_operation["action"] != "search"
+                           and time.monotonic() - self._last_candidates_at < 300)
         # Validate explicit selection before any browser access or active-chat fallback.
         choosing = "candidate_index" in p or "candidate_id" in p
         if "candidate_index" in p and (type(candidate_index) is not int or not 1 <= candidate_index <= 5):
@@ -922,7 +967,7 @@ class _WhatsAppWorker:
             action = "select" if pending["action"] == "search" else pending["action"]
             chat, message = pending["chat"], pending["message"]
             direction, limit = pending["direction"], pending["limit"]
-        elif chat:
+        elif chat and not preserve_search:
             # A new named operation invalidates the old list, even if lookup fails.
             self._clear_candidates()
             self._pending_operation = dict(action=action, chat=chat, message=message,
@@ -1004,6 +1049,13 @@ class _WhatsAppWorker:
             if not chat:
                 return "WHATSAPP_ERROR: Falta el nombre del chat."
             best, candidates = self._resolve_chat(page, chat)
+            if preserve_search:
+                return _dump("WHATSAPP_VERIFIED_SEARCH", {
+                    "query": chat, "match": best, "search_results": candidates,
+                    "pending_query": self._last_candidate_query,
+                    "candidates": self._last_candidates,
+                    "selection_instruction": "La selección sigue vinculada a la operación pendiente original. Los resultados de búsqueda no cambian sus opciones."
+                })
             if best:
                 self._clear_candidates()
                 numbered = candidates
@@ -1162,6 +1214,11 @@ def whatsapp_web(parameters: dict, response=None, player=None, session_memory=No
         return f"WHATSAPP_ERROR: {type(e).__name__}: {e}"
 
 
+def whatsapp_result(parameters, response=None, player=None, session_memory=None):
+    from core.text_tools import whatsapp_result as evidence
+    return evidence(whatsapp_web(parameters, response=response, player=player, session_memory=session_memory))
+
+
 TOOL = {
     "name": "whatsapp_web",
     "description": (
@@ -1187,5 +1244,7 @@ TOOL = {
         },
         "required": ["action"],
     },
+    "safe_actions": ('open', 'close', 'status', 'search', 'select', 'read', 'last_incoming', 'last_outgoing', 'recent', 'last', 'unread'),
     "handler": whatsapp_web,
+    "structured_handler": whatsapp_result,
 }

@@ -42,6 +42,16 @@ def kira_tasks(parameters: dict, response=None, player=None, session_memory=None
         _save(tasks)
         return f"Listo. Guardé como pendiente: {text}"
 
+    if action == "update":
+        if not text:
+            return "No pude actualizar la tarea: falta el texto."
+        for task in tasks:
+            if str(task.get('id')) == str(task_id):
+                task['text'] = text
+                _save(tasks)
+                return "Tarea actualizada: " + text
+        return "No encontré ese pendiente."
+
     if action in ("complete", "delete"):
         try:
             wanted = int(task_id)
@@ -97,7 +107,7 @@ TOOL = {
     "parameters": {
         "type": "OBJECT",
         "properties": {
-            "action": {"type": "STRING", "description": "list | add | complete | delete"},
+            "action": {"type": "STRING", "description": "list | add | update | complete | delete"},
             "text": {"type": "STRING", "description": "Texto de la tarea o parte del texto para identificarla."},
             "id": {"type": "INTEGER", "description": "ID de la tarea cuando se conoce."}
         },

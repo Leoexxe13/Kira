@@ -230,6 +230,10 @@ def call_llm(
     messages: list,
     tools:    list | None = None,
     timeout:  int = 120,
+    allow_restart: bool = True,
+    local_only: bool = False,
+    max_tokens: int = 150,
+    output_schema: dict | None = None,
 ) -> dict:
     """
     Non-streaming chat request.  Routes to Ollama or OpenAI-compatible backend.
@@ -239,6 +243,16 @@ def call_llm(
     """
     url, model = get_llm_settings()
     provider   = get_llm_provider()
+    post = requests.post
+    if local_only:
+        from urllib.parse import urlsplit
+        address = urlsplit(url)
+        if address.scheme not in ('http', 'https') or address.hostname not in ('localhost', '127.0.0.1', '::1'):
+            raise ValueError('El modo offline solo permite un servidor en este equipo')
+        def post(*args, **kwargs):
+            with requests.Session() as transport:
+                transport.trust_env = False
+                return transport.post(*args, allow_redirects=False, **kwargs)
 
     if provider == "openai":
         endpoint = f"{url}/v1/chat/completions"
@@ -246,13 +260,15 @@ def call_llm(
             "model":      model,
             "messages":   messages,
             "stream":     False,
-            "max_tokens": 150,
+            "max_tokens": max_tokens,
         }
+        if output_schema is not None:
+            payload['response_format'] = {'type':'json_schema','json_schema':{'name':'kira_plan','schema':output_schema}}
         if tools:
             payload["tools"]       = tools
             payload["tool_choice"] = "auto"
         try:
-            resp = requests.post(endpoint, json=payload, timeout=timeout)
+            resp = post(endpoint, json=payload, timeout=timeout)
             resp.raise_for_status()
             choice = resp.json().get("choices", [{}])[0]
             msg    = choice.get("message", {})
@@ -286,13 +302,17 @@ def call_llm(
         "messages":   messages,
         "stream":     False,
         "keep_alive": -1,
-        "options":    {"num_predict": 150, "num_gpu": 99},
+        "options":    {"num_predict": max_tokens, "num_gpu": 99},
     }
+    if output_schema is not None:
+        payload['format'] = output_schema
+        payload['options']['temperature'] = 0
+        payload['options']['num_ctx'] = 8192
     if tools:
         payload["tools"] = tools
 
     try:
-        resp = requests.post(endpoint, json=payload, timeout=timeout)
+        resp = post(endpoint, json=payload, timeout=timeout)
         resp.raise_for_status()
         data = resp.json()
         msg  = data.get("message", {})
@@ -301,6 +321,8 @@ def call_llm(
             "tool_calls": msg.get("tool_calls") or [],
         }
     except requests.exceptions.ConnectionError as e:
+        if not allow_restart:
+            raise RuntimeError('El modelo local no está disponible') from e
         print(f"[LLM] ConnectionError — trying to restart Ollama… ({e})")
         if ensure_ollama_running():
             try:
@@ -318,8 +340,8 @@ def call_llm(
             f"Cannot connect to Ollama at {url}. "
             "Make sure Ollama is installed and run: ollama serve"
         )
-    except requests.exceptions.Timeout:
-        raise RuntimeError("Ollama request timed out after 120 s.")
+    except requests.exceptions.Timeout as exc:
+        raise RuntimeError(f"Ollama request timed out (configured timeout={timeout}).") from exc
     except requests.exceptions.HTTPError as e:
         print(f"[LLM] HTTPError: {e.response.status_code} — {e.response.text[:200]}")
         raise RuntimeError(f"Ollama HTTP error: {e.response.status_code}")
@@ -367,6 +389,26 @@ def call_llm_text(
         )
     except Exception as e:
         raise RuntimeError(f"LLM text call failed: {e}")
+
+def call_llm_generate(prompt: str, system: str = '', timeout=8, model=None, output_schema=None) -> str:
+    """Small local structured generation using the shared chat transport.
+
+    Keeping this helper as the provider-manager seam is important: callers can
+    replace one local LLM operation in tests and diagnostics without having to
+    know which HTTP endpoint the current backend uses.  The shared transport
+    also makes failures retain the original connection cause.
+    """
+    messages = []
+    if system:
+        messages.append({'role': 'system', 'content': system})
+    messages.append({'role': 'user', 'content': prompt})
+    result = call_llm(
+        messages,
+        timeout=(2, timeout),
+        allow_restart=False,
+        output_schema=output_schema,
+    )
+    return str(result.get('content') or '').strip()
 
 
 def _stream_openai(

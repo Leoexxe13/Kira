@@ -55,6 +55,13 @@ def _empty_memory() -> dict:
     }
 
 def load_memory() -> dict:
+    from memory.user_memory import _active_memory
+    scoped = _active_memory.get()
+    if scoped is not None:
+        result = _empty_memory()
+        for row in scoped.recall('', limit=10000):
+            result[row['kind']][row['name']] = {'value':row['content'], 'updated':str(row['updated_at'])}
+        return result
     if not MEMORY_PATH.exists():
         return _empty_memory()
     with _lock:
@@ -116,6 +123,9 @@ def _trim_to_limit(memory: dict) -> dict:
     return memory
 
 def save_memory(memory: dict) -> None:
+    from memory.user_memory import _active_memory
+    if _active_memory.get() is not None:
+        raise RuntimeError('Las escrituras de memoria requieren la tool con confirmación y usuario vinculado')
     if not isinstance(memory, dict):
         return
     memory = _trim_to_limit(memory)

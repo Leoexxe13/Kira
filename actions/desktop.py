@@ -7,6 +7,7 @@ import subprocess
 import tempfile
 import platform
 from pathlib import Path
+from core.resource_resolver import resolve_path
 from datetime import datetime
 
 try:
@@ -27,7 +28,7 @@ def _get_api_key() -> str:
     path = _get_base_dir() / "config" / "api_keys.json"
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
-    
+
 def _get_desktop() -> Path:
     if _OS == "Linux":
         xdg = os.environ.get("XDG_DESKTOP_DIR", "")
@@ -57,7 +58,7 @@ def _build_sandbox() -> dict:
             "copytree":   shutil.copytree,
             "disk_usage": shutil.disk_usage,
         })(),
-        "os_path": os.path,  
+        "os_path": os.path,
     }
 
     if _PYAUTOGUI:
@@ -152,7 +153,7 @@ Task: {task}"""
         return f"ERROR: {e}"
 
 def set_wallpaper(image_path: str) -> str:
-    path = Path(image_path).expanduser().resolve()
+    path = resolve_path(image_path)
     if not path.exists():
         return f"Image not found: {image_path}"
     if path.suffix.lower() not in {".jpg", ".jpeg", ".png", ".bmp", ".webp"}:
@@ -168,7 +169,7 @@ def set_wallpaper(image_path: str) -> str:
                     Image.open(path).convert("RGB").save(bmp_path, "BMP")
                     path = bmp_path
                 except ImportError:
-                    pass 
+                    pass
             ctypes.windll.user32.SystemParametersInfoW(20, 0, str(path), 3)
             return f"Wallpaper set: {path.name}"
 
@@ -177,8 +178,14 @@ def set_wallpaper(image_path: str) -> str:
                 f'tell application "System Events" to tell every desktop to '
                 f'set picture to POSIX file "{path}"'
             )
-            subprocess.run(["osascript", "-e", script], capture_output=True)
-            return f"Wallpaper set: {path.name}"
+            script = 'tell application "System Events" to tell every desktop to set picture to POSIX file ' + json.dumps(str(path))
+            changed = subprocess.run(["osascript", "-e", script], capture_output=True, text=True, timeout=10)
+            if changed.returncode:
+                return "No pude cambiar el fondo: " + changed.stderr.strip()
+            check = subprocess.run(["osascript", "-e", 'tell application "System Events" to get picture of every desktop'], capture_output=True, text=True, timeout=10)
+            if check.returncode == 0 and str(path) in check.stdout:
+                return f"VERIFICADO: fondo de escritorio {path}"
+            return f"SOLICITADO: cambio de fondo a {path}; no se pudo verificar la lectura posterior."
 
         else:
             desktop_env = os.environ.get("XDG_CURRENT_DESKTOP", "").lower()
@@ -236,6 +243,9 @@ for (var i = 0; i < allDesktops.length; i++) {{
 
 
 def set_wallpaper_from_url(url: str) -> str:
+    from core.network_state import NETWORK
+    if not NETWORK.allowed:
+        return "OFFLINE: no se solicitó la descarga del fondo."
     try:
         import urllib.request
         suffix = Path(url.split("?")[0]).suffix or ".jpg"

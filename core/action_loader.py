@@ -48,6 +48,9 @@ class ActionRecord:
     file: str = ""
     valid: bool = False
     error: str = ""
+    structured_handler: Optional[Callable] = None
+    safe_actions: tuple = ()
+    semantic: bool = True
 
 
 class ActionRegistry:
@@ -66,8 +69,39 @@ class ActionRegistry:
     def has(self, name: str) -> bool:
         return name in self._actions
 
+    def semantic_capabilities(self):
+        return [d for d in self.get_tool_declarations() if self._actions[d['name']].semantic]
+
     def names(self) -> set[str]:
         return set(self._actions.keys())
+
+    def register(self, tool):
+        from types import SimpleNamespace
+        record = _validate(SimpleNamespace(TOOL=tool), '<session>')
+        if not record.valid:
+            raise ValueError(record.error)
+        self._actions[record.name] = record
+
+    def requires_confirmation(self, name, parameters):
+        record = self._actions[name]
+        return parameters.get('action', '*') not in record.safe_actions
+
+    def run_result(self, name, parameters, ctx=None):
+        """Typed evidence where supplied; legacy prose is never proof of success."""
+        record = self._actions.get(name)
+        if record is None or not record.valid:
+            return {'state': 'failed', 'text': 'Herramienta no disponible: '+name, 'data': None}
+        if record.structured_handler:
+            try:
+                return _call_handler(record.structured_handler, parameters, ctx or {})
+            except Exception as exc:
+                return {'state': 'failed', 'text': str(exc), 'data': None}
+        raw = self.run(name, parameters, ctx)
+        from core.tool_feedback import classify_result
+        tagged, failed, _ = classify_result(name, raw)
+        state = 'failed' if failed else ('pending' if tagged.startswith('[TOOL_PENDING]') else 'executed')
+        if not failed and str(raw).startswith('WHATSAPP_VERIFIED_'): state = 'verified'
+        return {'state': state, 'text': str(raw), 'data': None}
 
     # -- called by main.py from _execute_tool --
     def run(self, name: str, parameters: dict, ctx: dict | None = None) -> str:
@@ -75,7 +109,7 @@ class ActionRegistry:
         if rec is None or not rec.valid:
             return f"Action '{name}' is not available."
         try:
-            return _call_handler(rec.handler, parameters, ctx or {}) or "Done."
+            return _call_handler(rec.handler, parameters, ctx or {}) or "[TOOL_UNVERIFIED] La herramienta terminó sin devolver confirmación."
         except Exception as e:
             self._logger(f"Action '{name}' crashed during run(): {e}")
             traceback.print_exc()
@@ -123,7 +157,9 @@ def _validate(module, filename: str) -> ActionRecord:
                             error="TOOL['handler'] missing or not callable.")
 
     return ActionRecord(name=name, description=description.strip(), parameters=parameters,
-                        handler=handler, file=filename, valid=True, error="")
+                        handler=handler, file=filename, valid=True, error="",
+                        structured_handler=tool.get('structured_handler'),
+                        safe_actions=tuple(tool.get('safe_actions', ())), semantic=tool.get('semantic',True))
 
 
 def discover_actions(actions_dir: Path, reserved_names: set[str] | None = None,

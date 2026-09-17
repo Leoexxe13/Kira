@@ -46,12 +46,30 @@ class SafetyTests(unittest.TestCase):
                 self.assertIsNone(best)
                 self.assertEqual(len(candidates), 2)
 
+    def test_candidate_labels_identify_real_contacts(self):
+        self.rows = [dict(id='18095556812@c.us', name='Juan', score=1),
+                     dict(id='18095550944@c.us', name='Juan', score=1)]
+        result = self.pending('open')
+        rendered = str(result)
+        self.assertIn('Juan', rendered)
+
     def test_unique_and_duplicate_id(self):
         self.w._chat_rows = Mock(return_value=[dict(id='a', name='Alex', aliases=['Alex'])])
         self.w._contact_rows = Mock(return_value=[dict(id='a', name='Alex', aliases=['Alex'])])
         best, candidates = self.w._resolve_chat(self.page, 'Alex')
         self.assertEqual(best['id'], 'a')
         self.assertEqual(len(candidates), 1)
+
+    def test_equal_names_do_not_prove_lid_and_contact_are_same_person(self):
+        self.w._chat_rows = Mock(return_value=[
+            dict(id='9730682997714@lid', name='Deivy Jose', aliases=['Deivy Jose']),
+        ])
+        self.w._contact_rows = Mock(return_value=[
+            dict(id='18494017979@c.us', name='Deivy Jose', aliases=['Deivy Jose']),
+        ])
+        best, candidates = Worker._resolve_chat(self.w, self.page, 'deivy jose')
+        self.assertIsNone(best)
+        self.assertEqual(len(candidates), 2)
 
     def test_selection_continues_original_send(self):
         for choice in ({'candidate_index': 2}, {'candidate_id': 'b'}, {'candidate_index': 2, 'candidate_id': 'b'}):
@@ -96,13 +114,38 @@ class SafetyTests(unittest.TestCase):
         self.assertIn('UNVERIFIED', self.w._dispatch(dict(action='select', candidate_id='foreign')))
         self.w._send.assert_not_called()
 
-    def test_new_search_replaces_context_and_never_sends(self):
+    def test_intermediate_search_preserves_pending_send(self):
         self.pending()
+        timestamp = self.w._last_candidates_at
         self.w._dispatch(dict(action='search', chat='Other'))
-        self.assertEqual(self.w._pending_operation['action'], 'search')
-        self.assertIn('UNVERIFIED', self.w._dispatch(dict(action='send', candidate_index=2)))
+        self.assertEqual(self.w._pending_operation['action'], 'send')
+        self.assertEqual(timestamp, self.w._last_candidates_at)
+        self.w._send.assert_not_called()
+        self.w._dispatch(dict(action='select', candidate_index=2))
+        self.w._send.assert_called_once_with(self.page, 'b', 'synthetic')
+
+    def test_new_named_operation_replaces_pending(self):
+        self.pending()
+        self.w._dispatch(dict(action='open', chat='Other'))
+        self.assertEqual(self.w._pending_operation['action'], 'select')
         self.w._dispatch(dict(action='select', candidate_index=2))
         self.w._send.assert_not_called()
+
+    def test_unique_exact_precedes_similar_names(self):
+        self.w._chat_rows = Mock(return_value=[dict(id='a', name='Juan', aliases=[]), dict(id='b', name='Juan Carlos', aliases=[])])
+        self.w._contact_rows = Mock(return_value=[])
+        best, candidates = self.w._resolve_chat(self.page, ' JUAN ')
+        self.assertEqual(best['id'], 'a')
+
+    def test_open_named_chat_uses_chat_resolution(self):
+        self.w._resolve_chat = Mock(return_value=(dict(id='b', name='Alex Two', match_score=1.0), []))
+        result = self.w._dispatch({'action': 'open', 'chat': 'Alex Two'})
+        self.assertIn('WHATSAPP_VERIFIED_CHAT_OPEN', result)
+        self.w._open_id.assert_called_once()
+
+    def test_recipient_aliases_and_conflicts_are_explicit(self):
+        self.assertIn('UNVERIFIED', self.w._dispatch({'action': 'open', 'chat': 'Mami', 'recipient': 'Otra'}))
+        self.assertIn('UNVERIFIED', self.w._dispatch({'action': 'send', 'chat': 'Mami', 'message': 'uno', 'text': 'dos'}))
 
     def test_close_invalidates_and_reopen_cannot_resume(self):
         self.pending()
@@ -170,14 +213,15 @@ class SafetyTests(unittest.TestCase):
         self.w._messages.side_effect = RuntimeError('offline')
         self.assertFalse(Worker._send(self.w, self.page, 'b', 'synthetic')['verified'])
 
-    def test_failed_new_search_invalidates_old_list(self):
+    def test_failed_intermediate_search_preserves_pending(self):
         self.pending()
         self.w._resolve_chat.side_effect = RuntimeError('offline')
         with self.assertRaises(RuntimeError):
             self.w._dispatch(dict(action='search', chat='Other'))
-        self.assertFalse(self.w._last_candidates)
-        self.assertIn('UNVERIFIED', self.w._dispatch(dict(action='select', candidate_index=2)))
+        self.assertTrue(self.w._last_candidates)
         self.w._send.assert_not_called()
+        self.w._dispatch(dict(action='select', candidate_index=2))
+        self.w._send.assert_called_once_with(self.page, 'b', 'synthetic')
 
     def test_unconfirmed_status_and_send_failure(self):
         for payload, prefix in [({'ok':True,'verified':False}, 'WHATSAPP_SEND_REQUESTED'), ({'ok':False}, 'WHATSAPP_UNVERIFIED')]:

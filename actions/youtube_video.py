@@ -467,5 +467,6 @@ TOOL = {
         },
         "required": []
     },
+    "safe_actions": ('play',),
     "handler": youtube_video,
 }

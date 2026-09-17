@@ -1,0 +1,37 @@
+"""Presentation only: friendly Spanish labels; never declares availability."""
+CATALOG = {
+    'file_controller': ('Archivos y carpetas', 'Crea, busca, mueve y organiza recursos locales.', 'Crea una carpeta en el escritorio llamada Apuntes'),
+    'file_processor': ('Analizar documentos', 'Procesa el archivo que indiques; el análisis IA necesita conexión.', 'Resume el archivo adjunto'),
+    'browser_control': ('Control del navegador', 'Abre páginas y opera el navegador con una petición explícita.', 'Abre Spotify en Chrome'),
+    'web_search': ('Buscar en Internet', 'Consulta información actual en la web.', 'Busca noticias de astronomía'),
+    'whatsapp_web': ('WhatsApp', 'Abre chats y envía mensajes con selección segura del destinatario.', 'Abre el chat de Juan'),
+    'screen_process': ('Ver cámara o pantalla', 'Analiza una captura solicitada; no graba permanentemente.', 'Qué hay en mi pantalla'),
+    'screen_processor': ('Visión', 'Captura cámara o pantalla cuando se solicita.', 'Qué ves'),
+    'close_camera': ('Cerrar cámara', 'Detiene la sesión visual y libera el dispositivo.', 'Cierra la cámara'),
+    'kira_tasks': ('Pendientes', 'Guarda, consulta y completa tareas locales.', 'Agrega estudiar a pendientes'),
+    'reminder': ('Recordatorios', 'Programa avisos locales.', 'Recuérdame descansar en 10 minutos'),
+    'open_app': ('Abrir aplicación', 'Solicita abrir una aplicación instalada.', 'Abre Safari'),
+    'system_status': ('Estado del sistema', 'Consulta métricas disponibles del equipo.', 'Estado del sistema'),
+    'system_monitor': ('Monitor del sistema', 'Consulta recursos y métricas reales.', 'Consulta el uso de CPU'),
+    'background_monitor': ('Seguimiento del sistema', 'Revisa condiciones del sistema en segundo plano.', 'Qué monitores están activos'),
+    'manage_monitor': ('Gestionar monitores', 'Configura los monitores existentes.', 'Lista los monitores activos'),
+    'computer_control': ('Control del equipo', 'Opera controles del equipo según la petición.', 'Qué controles del equipo están disponibles'),
+    'computer_settings': ('Ajustes del equipo', 'Ajusta opciones locales compatibles.', 'Pon el volumen a 30'),
+    'desktop_control': ('Escritorio', 'Cambia el fondo y organiza el escritorio.', 'Pon esa imagen de fondo'),
+    'desktop': ('Escritorio', 'Gestiona el escritorio y su fondo.', 'Pon esa imagen de fondo'),
+    'youtube_video': ('YouTube', 'Busca o abre vídeos con conexión.', 'Busca un vídeo de astronomía'),
+    'weather_report': ('Clima', 'Consulta el clima para una ubicación indicada.', 'Consulta el clima en Santo Domingo'),
+    'flight_finder': ('Vuelos', 'Busca opciones de vuelo según tus criterios.', 'Busca vuelos para las fechas que te indique'),
+    'code_helper': ('Ayuda con código', 'Analiza código y explica errores.', 'Explica el error del archivo adjunto'),
+    'dev_agent': ('Desarrollo', 'Ayuda con tareas de programación.', 'Revisa este proyecto'),
+    'game_updater': ('Actualizaciones de juegos', 'Consulta actualizaciones mediante la integración existente.', 'Consulta actualizaciones de juegos'),
+    'proactive': ('Asistencia contextual', 'Consulta sugerencias de la integración existente.', 'Qué sugerencias tienes'),
+    'send_message': ('Mensajería', 'Solicita una acción de mensajería con destinatario explícito.', 'Qué opciones de mensajería hay'),
+    'save_memory': ('Guardar memoria', 'Guarda información que autorices recordar.', 'Recuerda mi preferencia'),
+    'recall_memory': ('Consultar memoria', 'Busca información guardada.', 'Qué recuerdas de mis preferencias'),
+    'undo': ('Deshacer', 'Revierte una operación que disponga de deshacer.', 'Qué acciones puedes deshacer'),
+    'shutdown_jarvis': ('Cerrar KIRA', 'Solicita cerrar el asistente.', 'Cierra KIRA'),
+}
+
+def presentation(name):
+    return CATALOG.get(name, (name, 'Integración registrada. Consulta sus opciones antes de usarla.', 'Qué opciones tiene ' + name))

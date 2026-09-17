@@ -62,7 +62,7 @@ def _save_config_key(key: str, value) -> None:
 
 
 def _get_os() -> str:
-    return _load_config().get("os_system", "windows").lower()
+    return "mac" if sys.platform == "darwin" else ("windows" if sys.platform == "win32" else "linux")
 
 
 _IMG_MAX_W = 1280
@@ -85,18 +85,21 @@ def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]
         return img_bytes, f"image/{source_format.lower()}"
 
 
-def _capture_screen() -> tuple[bytes, str]:
+def _capture_screen(region=None) -> tuple[bytes, str]:
 
     if not _MSS:
         raise RuntimeError("mss is not installed. Run: pip install mss")
 
     with mss.mss() as sct:
         monitors = sct.monitors          # [0] = all combined, [1..n] = real screens
-        target   = monitors[1] if len(monitors) > 1 else monitors[0]
+        target = region if region is not None else monitors[0]
+        if not isinstance(target, dict) or target.get("width", 0)<=0 or target.get("height",0)<=0:
+            raise ValueError("Región de pantalla inválida")
         shot     = sct.grab(target)
         png      = mss.tools.to_png(shot.rgb, shot.size)
 
-    return _compress(png, "PNG")
+    from core.vision_context import validate_frame
+    return validate_frame(*_compress(png, "PNG"))
 
 
 def _cv2_backend() -> int:
@@ -116,13 +119,14 @@ def _probe_camera(index: int, backend: int, warmup: int = 5) -> bool:
     if not _CV2:
         return False
     cap = cv2.VideoCapture(index, backend)
-    if not cap.isOpened():
+    try:
+        if not cap.isOpened():
+            return False
+        for _ in range(warmup):
+            cap.read()
+        ret, frame = cap.read()
+    finally:
         cap.release()
-        return False
-    for _ in range(warmup):
-        cap.read()
-    ret, frame = cap.read()
-    cap.release()
     if not ret or frame is None:
         return False
     return bool(np.mean(frame) > 8)
@@ -159,17 +163,17 @@ def _capture_camera() -> tuple[bytes, str]:
     backend = _cv2_backend()
     cap     = cv2.VideoCapture(index, backend)
 
-    if not cap.isOpened():
-        raise RuntimeError(f"Camera index {index} could not be opened.")
-
-    for _ in range(10):
-        cap.read()
-
-    ret, frame = cap.read()
-    cap.release()
-
-    if not ret or frame is None:
-        raise RuntimeError("Camera returned no frame.")
+    try:
+        if not cap.isOpened():
+            raise RuntimeError(f"Camera index {index} could not be opened.")
+        frame = None
+        for _ in range(10):
+            ret, sample = cap.read()
+            if ret and sample is not None: frame=sample
+        if frame is None or not getattr(frame, 'size', 0):
+            raise RuntimeError("Camera returned no frame.")
+    finally:
+        cap.release()
 
     if _PIL:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -177,7 +181,8 @@ def _capture_camera() -> tuple[bytes, str]:
         img.thumbnail((_IMG_MAX_W, _IMG_MAX_H), PIL.Image.BILINEAR)
         buf = io.BytesIO()
         img.save(buf, format="JPEG", quality=_JPEG_Q)
-        return buf.getvalue(), "image/jpeg"
+        from core.vision_context import validate_frame
+        return validate_frame(buf.getvalue(), "image/jpeg")
 
     _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, _JPEG_Q])
     return buf.tobytes(), "image/jpeg"

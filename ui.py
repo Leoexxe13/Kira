@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 import psutil
+from ui_hud import Panel, Sparkline, Terrain, ProviderList, label as hud_label, STYLE as HUD_STYLE
 
 if platform.system() == "Windows":
     _WIN_HIDE: dict = {"creationflags": subprocess.CREATE_NO_WINDOW}
@@ -34,7 +35,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import (
     QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMainWindow, QPushButton, QScrollArea, QSizePolicy, QSplitter,
-    QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar,
+    QStackedWidget, QTextEdit, QVBoxLayout, QWidget, QProgressBar, QGridLayout, QListWidget, QListWidgetItem,
 )
 
 # ── Which Mark this is ───────────────────────────────────────────────────────
@@ -430,7 +431,7 @@ class HudCanvas(QWidget):
 
         self._tmr = QTimer(self)
         self._tmr.timeout.connect(self._step)
-        self._tmr.start(16)
+        self._tmr.start(33)
 
     def set_audio_level(self, level: float) -> None:
         """Thread-safe entry point for the audio threads. Stores the louder of
@@ -482,6 +483,8 @@ class HudCanvas(QWidget):
         return pm
 
     def _step(self):
+        if not self.isVisible():
+            return
         self._tick += 1
         now = time.time()
 
@@ -760,7 +763,7 @@ class KiraCoreV2(HudCanvas):
         W, H = self.width(), self.height()
         cx, cy = W / 2.0, H / 2.0
         base = min(W, H)
-        R = base * 0.29
+        R = base * 0.34
 
         # Technical grid.
         p.setPen(QPen(qcol(C.BORDER, 50), 1))
@@ -778,6 +781,18 @@ class KiraCoreV2(HudCanvas):
         amp = max(0.0, min(1.0, getattr(self, "_amp_disp", 0.0)))
         pulse = 1.0 + amp * 0.10 + math.sin(self._tick * 0.035) * 0.012
 
+        glow = QRadialGradient(QPointF(cx, cy), R * 1.1)
+        glow.setColorAt(0, QColor(170, 195, 225, 28))
+        glow.setColorAt(.45, QColor(100, 140, 180, 8))
+        glow.setColorAt(1, QColor(0, 0, 0, 0))
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QBrush(glow))
+        p.drawEllipse(QRectF(cx-R*1.1, cy-R*1.1, R*2.2, R*2.2))
+        p.setPen(QPen(QColor(166, 189, 215, 65), .6))
+        for i in range(140):
+            angle = math.radians(i*137.5 + self._scan*.08)
+            radius = R*(1.08 + .28*((i*17)%31)/31)
+            p.drawPoint(QPointF(cx+math.cos(angle)*radius, cy+math.sin(angle)*radius))
         # Outer soft halo.
         for i in range(4):
             rr = R * (1.02 + i * 0.075) * pulse
@@ -859,8 +874,8 @@ class KiraCoreV2(HudCanvas):
 
         # Rotating wireframe longitude curves.
         p.setPen(QPen(qcol(C.PRI, 120), 1))
-        for i in range(7):
-            offset = (i - 3) / 3.0
+        for i in range(16):
+            offset = (i - 7.5) / 7.5
             squeeze = max(0.14, abs(math.cos(phase + offset * 0.7)))
             shift = math.sin(phase + offset * 0.8) * orb_r * 0.10
             w = orb_r * 2 * squeeze
@@ -872,8 +887,8 @@ class KiraCoreV2(HudCanvas):
             ))
 
         # Rotating latitude curves.
-        for i in range(5):
-            offset = (i - 2) / 2.0
+        for i in range(12):
+            offset = (i - 5.5) / 5.5
             squeeze = max(0.16, abs(math.sin(phase * 0.8 + offset * 0.7)))
             shift = math.cos(phase + offset) * orb_r * 0.08
             h = orb_r * 2 * squeeze
@@ -901,25 +916,36 @@ class KiraCoreV2(HudCanvas):
         p.setBrush(qcol(C.PRI, 255))
         p.drawEllipse(QRectF(cx - dot_r, cy - dot_r, dot_r * 2, dot_r * 2))
 
-        # State under orb; no static KIRA name inside.
+        # HUD legends are labels; only the actual reported state is highlighted.
+        p.setFont(QFont("Menlo", 7))
+        for j, word in enumerate(("LISTEN", "THINK", "REASON", "PLAN", "ACT")):
+            p.setPen(qcol(C.TEXT_MED, 180))
+            p.drawText(QPointF(9, cy - 35 + j * 16), "· " + word)
+        if W > 420:
+            for j, word in enumerate(("CONTEXT", "MEMORY", "TOOLS", "LOCAL + CLOUD")):
+                p.drawText(QRectF(W-115, cy-35+j*16, 105, 16), int(Qt.AlignmentFlag.AlignRight), word)
+        p.setPen(qcol(C.WHITE, 230))
+        p.setFont(QFont("Menlo", 10))
+        p.drawText(QRectF(0, H-24, W, 20), int(Qt.AlignmentFlag.AlignCenter), self._assistant_name + "  /  INTELLIGENCE CORE")
+        # Actual state beneath the core.
         state_txt = str(getattr(self, "state", "LISTO")).upper()
         p.setPen(qcol(C.TEXT_MED, 220))
         p.setFont(QFont("Courier New", max(7, int(base * 0.011)), QFont.Weight.Bold))
         p.drawText(
-            QRectF(cx - R, cy + R * 1.38, R * 2, 20),
+            QRectF(cx - R, H - 48, R * 2, 20),
             int(Qt.AlignmentFlag.AlignCenter),
             state_txt
         )
 
         # Reactive waveform.
-        wave_y = cy + R * 1.57
+        wave_y = H - 55
         wave_w = R * 1.30
         p.setPen(QPen(qcol(C.PRI, 120), 1))
         for i in range(34):
             rel = i / 33.0
             x = cx - wave_w / 2 + rel * wave_w
             wobble = math.sin(self._tick * 0.15 + i * 0.75)
-            h = 3 + (7 + amp * 18) * abs(wobble)
+            h = 1 + amp * 24 * abs(wobble)
             p.drawLine(QPointF(x, wave_y - h / 2), QPointF(x, wave_y + h / 2))
 
         p.end()
@@ -1113,6 +1139,7 @@ def _fmt_size(size: int) -> str:
 
 class FileDropZone(QWidget):
     file_selected = pyqtSignal(str)
+    file_cleared = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1173,7 +1200,11 @@ class FileDropZone(QWidget):
         return self._current_file
 
     def clear_file(self):
-        self._current_file = None; self._canvas.update()
+        had_file = self._current_file is not None
+        self._current_file = None
+        self._canvas.update()
+        if had_file:
+            self.file_cleared.emit()
 
     def _browse(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -2989,8 +3020,9 @@ class KiraChatFeed(QScrollArea):
         self._body = QWidget()
         self._body.setStyleSheet("background:#050505;")
         self._lay = QVBoxLayout(self._body)
-        self._lay.setContentsMargins(12,12,12,12)
-        self._lay.setSpacing(10)
+        self._lay.setContentsMargins(18,16,18,16)
+        self._lay.setSpacing(16)
+        self._bubbles = []
         self._lay.addStretch(1)
         self.setWidget(self._body)
 
@@ -2998,6 +3030,7 @@ class KiraChatFeed(QScrollArea):
         self.append_log(text)
 
     def clear(self):
+        self._bubbles.clear()
         while self._lay.count() > 1:
             it = self._lay.takeAt(0)
             w = it.widget()
@@ -3025,9 +3058,10 @@ class KiraChatFeed(QScrollArea):
         self._last_message_role_v62=role; self._last_message_norm_v62=normalized; self._last_message_time_v62=now
         row=QWidget(); row.setStyleSheet('background:transparent;'); h=QHBoxLayout(row); h.setContentsMargins(0,0,0,0); h.setSpacing(8)
         if role=='user':h.addStretch(1)
-        bubble=QWidget(); bubble.setMaximumWidth(560); bv=QVBoxLayout(bubble); bv.setContentsMargins(12,9,12,8); bv.setSpacing(4)
-        msg=QLabel(body); msg.setWordWrap(True); msg.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); msg.setFont(QFont('Helvetica Neue',10))
-        stamp=QLabel(datetime.now().strftime('%H:%M')); stamp.setFont(QFont('Courier New',7))
+        bubble=QWidget(); bubble.setMaximumWidth(max(180, int(self.viewport().width() * .67))); bv=QVBoxLayout(bubble); bv.setContentsMargins(16,12,16,12); bv.setSpacing(6)
+        self._bubbles.append(bubble)
+        msg=QLabel(body); msg.setTextFormat(Qt.TextFormat.PlainText); msg.setWordWrap(True); msg.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); msg.setFont(QFont('Helvetica Neue',10))
+        stamp=QLabel(('Tú' if role=='user' else 'KIRA') + '  ·  ' + datetime.now().strftime('%H:%M')); stamp.setFont(QFont('Courier New',8))
         if role=='user':
             bubble.setStyleSheet('background:#ededed;border:1px solid #fff;border-radius:11px;'); msg.setStyleSheet('color:#080808;background:transparent;border:none;'); stamp.setAlignment(Qt.AlignmentFlag.AlignRight); stamp.setStyleSheet('color:#555;background:transparent;border:none;')
         else:
@@ -3035,11 +3069,18 @@ class KiraChatFeed(QScrollArea):
         bv.addWidget(msg); bv.addWidget(stamp); h.addWidget(bubble)
         if role=='kira':h.addStretch(1)
         self._lay.insertWidget(self._lay.count()-1,row)
-        QTimer.singleShot(0,lambda:self.verticalScrollBar().setValue(self.verticalScrollBar().maximum()))
-        QTimer.singleShot(80,lambda:self.verticalScrollBar().setValue(self.verticalScrollBar().maximum()))
+        bar = self.verticalScrollBar()
+        if role == 'user' or bar.maximum() - bar.value() < 80:
+            QTimer.singleShot(0,lambda:self.verticalScrollBar().setValue(self.verticalScrollBar().maximum()))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        for bubble in getattr(self, '_bubbles', []):
+            bubble.setMaximumWidth(max(180,int(self.viewport().width()*.67)))
 
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
+    _tasks_refresh_sig = pyqtSignal()
     _state_sig      = pyqtSignal(str)
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
     _reconfig_sig   = pyqtSignal()           # trigger setup overlay from any thread
@@ -3065,15 +3106,14 @@ class MainWindow(QMainWindow):
         if _ui_color and _ui_color.lower() != DEFAULT_UI_COLOR:
             apply_ui_accent(_ui_color)
 
-        self.setWindowTitle("KIRA // BLACK OPS")
+        self.setWindowTitle(self._assistant_name.upper())
         self.setMinimumSize(_MIN_W, _MIN_H)
         self.resize(_DEFAULT_W, _DEFAULT_H)
 
         screen = QApplication.primaryScreen().availableGeometry()
-        self.move(
-            (screen.width()  - _DEFAULT_W) // 2,
-            (screen.height() - _DEFAULT_H) // 2,
-        )
+        self.resize(min(1380, int(screen.width() * .94)), min(880, int(screen.height() * .92)))
+        self.move(screen.x() + (screen.width()-self.width())//2,
+                  screen.y() + (screen.height()-self.height())//2)
 
         self.on_text_command   = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
@@ -3081,6 +3121,9 @@ class MainWindow(QMainWindow):
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
+        self.get_tools = None
+        self._attached_files = []
+        self._metric_charts = {}
         self.get_plugins       = None   # callable: () -> list[dict], set by JarvisLive
         self.get_plugin_settings = None # callable: () -> list[dict] settings schemas, set by JarvisLive
         self.on_wake_toggle    = None   # callable: (enable: bool) -> str, set by JarvisLive
@@ -3098,15 +3141,16 @@ class MainWindow(QMainWindow):
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
-        root.addWidget(self._build_header())
-        # === KIRA_NAV_CHAT_FIX_V1 ===
-        root.addWidget(self._build_app_nav())
+        nav = self._build_app_nav()
+        header = self._build_header()
+        header.layout().insertWidget(1, nav, 1)
+        root.addWidget(header)
 
         # === KIRA_REAL_PAGES_V1 ===
         # Build original functional widgets first; then place them on distinct pages.
         self._left_panel = self._build_left_panel()
-        self._left_panel.setMinimumWidth(230)
-        self._left_panel.setMaximumWidth(310)
+        self._left_panel.setMinimumWidth(0)
+        self._left_panel.setMaximumWidth(16777215)
 
         # KIRA core + content/news/briefing panel.
         self.hud = KiraCoreV2(face_path, _display)
@@ -3188,6 +3232,15 @@ class MainWindow(QMainWindow):
         _kira_layout.addWidget(self._center_split, 1)
 
         self._tasks_page = self._build_real_tasks_page()
+        self._tools_page = self._build_tools_page()
+        from ui_personal import PersonalHub
+        self._knowledge_page = PersonalHub(self._build_knowledge_page(), logger=self._log_sig.emit)
+        self._settings_page = QWidget()
+        self._settings_page.setObjectName("SettingsPage")
+        self._settings_page_layout = QVBoxLayout(self._settings_page)
+        self._settings_page_layout.setContentsMargins(8, 8, 8, 8)
+        self._settings_page_layout.setSpacing(6)
+        self._settings_page_layout.addWidget(self._kira_section_title("SETTINGS // CONTROLS"))
 
         self._chat_page = QWidget()
         _chat_layout = QVBoxLayout(self._chat_page)
@@ -3199,6 +3252,8 @@ class MainWindow(QMainWindow):
             f"color:{C.WHITE}; background:transparent; letter-spacing:2px;"
         )
         _chat_layout.addWidget(_chat_title)
+        self._chat_processing = hud_label("", 9, True)
+        _chat_layout.addWidget(self._chat_processing)
         _chat_layout.addWidget(self._right_panel, 1)
 
         for _page in (
@@ -3207,6 +3262,9 @@ class MainWindow(QMainWindow):
             self._kira_page,
             self._tasks_page,
             self._chat_page,
+            self._tools_page,
+            self._knowledge_page,
+            self._settings_page,
         ):
             self._workspace_stack.addWidget(_page)
 
@@ -3217,6 +3275,10 @@ class MainWindow(QMainWindow):
 
         # Quick-access drawer (floating overlay, built after central widget layout is done)
         self._quick_drawer = self._build_quick_drawer()
+        self._quick_drawer.setParent(self._settings_page)
+        self._quick_drawer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self._quick_drawer.show()
+        self._settings_page_layout.addWidget(self._quick_drawer, 1)
         self._update_autostart_btn(self._check_autostart())
         from memory.config_manager import get_brief_enabled as _gbe
         self._update_brief_btn(_gbe())
@@ -3230,11 +3292,13 @@ class MainWindow(QMainWindow):
         self._metric_tmr = QTimer(self)
         self._metric_tmr.timeout.connect(self._update_metrics)
         self._metric_tmr.timeout.connect(self._update_kira_page_metrics)
+        self._metric_tmr.timeout.connect(self._refresh_tools_page)
         self._metric_tmr.start(2000)
         self._update_metrics()
 
-        self._log_sig.connect(self._log.append_log)
-        self._log_sig.connect(self._home_activity.append)
+        self._log_sig.connect(self._route_ui_log)
+        self._tasks_refresh_sig.connect(self._sync_tasks_from_disk)
+        self._tasks_refresh_sig.connect(self._knowledge_page.refresh_visible)
         self._state_sig.connect(self._apply_state)
         self._state_sig.connect(self._mirror_kira_state)
         self._content_sig.connect(self._show_content)
@@ -3258,7 +3322,8 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().dataChanged.connect(self._on_clipboard_changed)
 
         self._overlay: SetupOverlay | None = None
-        self._ready = self._check_config()
+        from core.runtime_config import VOICE_ENABLED
+        self._ready = self._check_config() if VOICE_ENABLED else True
         if not self._ready:
             self._show_setup()
 
@@ -3279,6 +3344,7 @@ class MainWindow(QMainWindow):
 
     def _kira_metric_box(self, name: str):
         box = QWidget()
+        box.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         box.setStyleSheet(
             f"background:{C.PANEL}; border:1px solid {C.BORDER}; border-radius:4px;"
         )
@@ -3288,11 +3354,11 @@ class MainWindow(QMainWindow):
 
         n = QLabel(name)
         n.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        n.setStyleSheet(f"color:{C.TEXT_MED}; background:transparent;")
+        n.setStyleSheet(f"color:{C.TEXT_MED}; background:transparent; border:none;")
 
         value = QLabel("--")
         value.setFont(QFont("Courier New", 15, QFont.Weight.Bold))
-        value.setStyleSheet(f"color:{C.WHITE}; background:transparent;")
+        value.setStyleSheet(f"color:{C.WHITE}; background:transparent; border:none;")
 
         bar = QProgressBar()
         bar.setRange(0, 100)
@@ -3346,207 +3412,210 @@ class MainWindow(QMainWindow):
 
     def _refresh_provider_status_v4(self):
         try:
+            from core.network_state import NETWORK
             from core.provider_manager import ProviderManager
-            st = ProviderManager().status()
-            gemini = "LISTO" if st.get("gemini_live") else "OFF"
-            groq = "LISTO" if st.get("groq") else "SIN CONFIGURAR"
-            if hasattr(self, "_home_provider_status"):
-                self._home_provider_status.setText(
-                    f"GEMINI LIVE   {gemini}\n"
-                    f"GROQ FREE     {groq}\n"
-                    "PAID APIS     DISABLED\n"
-                    f"MODE          {str(st.get('mode','free_first')).upper()}"
-                )
+            pm = ProviderManager()
+            st = pm.status()
+            runtime = self.get_runtime_status() if getattr(self, 'get_runtime_status', None) else {}
+            connected = runtime.get('gemini_connected', False) and NETWORK.allowed
+            groq_model = str(pm.cfg.get('providers', {}).get('groq', {}).get('model') or 'Modelo no indicado')
+            lines = [
+                ('✦', '#97afff', 'Gemini', runtime.get('gemini_model') or 'Modelo no publicado', 'Voz · visión', 'CONECTADO' if connected else 'SIN SESIÓN'),
+                ('g', '#dcac87', 'Groq', groq_model, 'Texto', ('CONFIGURADO' if st.get('groq') else 'SIN CONFIGURAR') if NETWORK.allowed else 'PAUSADO · OFFLINE'),
+                ('◎', '#d8d8d8', 'OpenAI', '—', 'Integración no habilitada', 'DESHABILITADO'),
+                ('A', '#c5a78f', 'Anthropic', '—', 'Integración no habilitada', 'DESHABILITADO'),
+            ]
+            from core.llm_client import _load_config
+            local = _load_config()
+            if local.get('llm_model'):
+                lines.append(('◉', '#b8b8b8', 'Local', str(local['llm_model']), 'Texto', 'CONFIGURADO · SIN SONDEAR'))
+            self._home_provider_status.update_providers(lines, NETWORK.state.value)
+            if hasattr(self, "_settings_providers"):
+                self._settings_providers.setText('\n'.join(f'{name}: {state} · {model}' for _,_,name,model,_,state in lines))
         except Exception:
-            pass
+            self._home_provider_status.show_error()
 
     def _build_real_home_page(self) -> QWidget:
         page = QWidget()
-        page.setObjectName("KiraHomeV4")
-        page.setStyleSheet("QWidget#KiraHomeV4{background:#020202;}")
-
+        page.setObjectName("KiraHome")
+        page.setStyleSheet(HUD_STYLE)
         root = QHBoxLayout(page)
-        root.setContentsMargins(10,10,10,10)
-        root.setSpacing(10)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(8)
+        columns = []
+        for stretch in (25, 49, 26):
+            column = QWidget()
+            layout = QVBoxLayout(column)
+            layout.setContentsMargins(0, 0, 0, 0)
+            layout.setSpacing(8)
+            root.addWidget(column, stretch)
+            columns.append(layout)
+        left, center, right = columns
 
-        left = QWidget()
-        left.setMinimumWidth(265)
-        left.setMaximumWidth(320)
-        lv = QVBoxLayout(left)
-        lv.setContentsMargins(0,0,0,0)
-        lv.setSpacing(10)
+        tasks = Panel("PENDING TASKS // TODAY")
+        self._home_pending_count = tasks.badge
+        self._home_task_list = QVBoxLayout()
+        tasks.body.addLayout(self._home_task_list, 1)
+        self._home_pending_preview = hud_label("Sin pendientes registrados.", 9, True)
+        self._home_pending_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        tasks.body.addWidget(self._home_pending_preview, 1)
+        view = QPushButton("Gestionar tareas  →")
+        view.clicked.connect(lambda: self._switch_workspace("tasks"))
+        tasks.body.addWidget(view)
+        left.addWidget(tasks, 3)
 
-        sys_box = QWidget()
-        sys_box.setStyleSheet("background:#080808;border:1px solid #303030;border-radius:6px;")
-        sv = QVBoxLayout(sys_box)
-        sv.setContentsMargins(11,10,11,11)
-        sv.setSpacing(7)
-        sv.addWidget(self._kira_section_title("SYSTEM // LIVE"))
-        for title, a, b in (
-            ("CPU","_home_cpu","_home_cpu_bar"),
-            ("RAM","_home_ram","_home_ram_bar"),
-            ("NETWORK","_home_net","_home_net_bar"),
-            ):
-            card, lbl, bar = self._kira_metric_box(title)
-            setattr(self,a,lbl)
-            setattr(self,b,bar)
-            sv.addWidget(card)
-        lv.addWidget(sys_box,0)
-
-        tasks = QWidget()
-        tasks.setMinimumHeight(235)
-        tasks.setStyleSheet("background:#080808;border:1px solid #3a3a3a;border-radius:6px;")
-        tv = QVBoxLayout(tasks)
-        tv.setContentsMargins(11,10,11,11)
-        tv.setSpacing(8)
-
-        th = QHBoxLayout()
-        t = QLabel("PENDIENTES // HOY")
-        t.setFont(QFont("Courier New",9,QFont.Weight.Bold))
-        t.setStyleSheet("color:#f4f4f4;background:transparent;border:none;")
-        th.addWidget(t)
-        th.addStretch()
-
-        self._home_pending_count = QLabel("0")
-        self._home_pending_count.setFixedSize(31,24)
-        self._home_pending_count.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._home_pending_count.setFont(QFont("Courier New",9,QFont.Weight.Bold))
-        self._home_pending_count.setStyleSheet(
-            "color:#050505;background:#f1f1f1;border:none;border-radius:4px;"
-        )
-        th.addWidget(self._home_pending_count)
-        tv.addLayout(th)
-
-        self._home_pending_preview = QLabel("Sin pendientes.")
-        self._home_pending_preview.setWordWrap(True)
-        self._home_pending_preview.setAlignment(Qt.AlignmentFlag.AlignTop|Qt.AlignmentFlag.AlignLeft)
-        self._home_pending_preview.setMinimumHeight(170)
-        self._home_pending_preview.setFont(QFont("Helvetica Neue",10))
-        self._home_pending_preview.setStyleSheet(
-            "color:#e8e8e8;background:#050505;border:1px solid #272727;"
-            "border-radius:4px;padding:11px;"
-        )
-        tv.addWidget(self._home_pending_preview,1)
-        lv.addWidget(tasks,1)
-
-        center = QWidget()
-        cv = QVBoxLayout(center)
-        cv.setContentsMargins(0,0,0,0)
-        cv.setSpacing(10)
-
-        core = QWidget()
-        core.setStyleSheet("background:#050505;border:1px solid #333;border-radius:6px;")
-        c = QVBoxLayout(core)
-        c.setContentsMargins(10,8,10,8)
-
-        ch = QHBoxLayout()
-        ct = QLabel("KIRA CORE")
-        ct.setFont(QFont("Courier New",10,QFont.Weight.Bold))
-        ct.setStyleSheet("color:#f4f4f4;background:transparent;border:none;")
-        ch.addWidget(ct)
-        ch.addStretch()
-        self._home_state = QLabel("● ONLINE")
-        self._home_state.setFont(QFont("Courier New",8,QFont.Weight.Bold))
-        self._home_state.setStyleSheet("color:#ddd;background:transparent;border:none;")
-        ch.addWidget(self._home_state)
-        c.addLayout(ch)
-
-        self._home_core = KiraCoreV2(self._face_path, self._assistant_name.upper())
-        self._home_core.setMinimumHeight(350)
-        c.addWidget(self._home_core,1)
-        cv.addWidget(core,3)
-
-        focus = QWidget()
-        focus.setMinimumHeight(175)
-        focus.setStyleSheet("background:#080808;border:1px solid #333;border-radius:6px;")
-        fv = QVBoxLayout(focus)
-        fv.setContentsMargins(11,9,11,11)
-        fh = QHBoxLayout()
-        ft = QLabel("HOY // EN FOCO")
-        ft.setFont(QFont("Courier New",9,QFont.Weight.Bold))
-        ft.setStyleSheet("color:#f4f4f4;background:transparent;border:none;")
-        fh.addWidget(ft)
-        fh.addStretch()
-        badge = QLabel("RESUMEN / NOTICIAS")
-        badge.setFont(QFont("Courier New",7,QFont.Weight.Bold))
-        badge.setStyleSheet("color:#888;background:#111;border:1px solid #2a2a2a;padding:3px 7px;")
-        fh.addWidget(badge)
-        fv.addLayout(fh)
-
-        self._home_briefing = QTextEdit()
-        self._home_briefing.setReadOnly(True)
-        self._home_briefing.setFont(QFont("Helvetica Neue",10))
-        self._home_briefing.setStyleSheet(
-            "background:#050505;color:#dadada;border:1px solid #272727;"
-            "border-radius:4px;padding:9px;"
-        )
-        self._home_briefing.setPlainText(
-            "Aquí aparecerán tus noticias, briefing y contexto útil del día."
-        )
-        fv.addWidget(self._home_briefing,1)
-        cv.addWidget(focus,1)
-
-        right = QWidget()
-        right.setMinimumWidth(290)
-        right.setMaximumWidth(360)
-        rv = QVBoxLayout(right)
-        rv.setContentsMargins(0,0,0,0)
-        rv.setSpacing(10)
-
-        activity = QWidget()
-        activity.setStyleSheet("background:#080808;border:1px solid #333;border-radius:6px;")
-        av = QVBoxLayout(activity)
-        av.setContentsMargins(11,9,11,11)
-        ah = QHBoxLayout()
-        at = QLabel("ACTIVIDAD // RECIENTE")
-        at.setFont(QFont("Courier New",9,QFont.Weight.Bold))
-        at.setStyleSheet("color:#f4f4f4;background:transparent;border:none;")
-        ah.addWidget(at)
-        ah.addStretch()
-        live = QLabel("LIVE")
-        live.setFont(QFont("Courier New",7,QFont.Weight.Bold))
-        live.setStyleSheet("color:#080808;background:#eaeaea;border:none;padding:3px 7px;")
-        ah.addWidget(live)
-        av.addLayout(ah)
-
+        activity = Panel("LIVE INTELLIGENCE", "EVENTOS")
         self._home_activity = QTextEdit()
         self._home_activity.setReadOnly(True)
-        self._home_activity.setFont(QFont("Courier New",8))
-        self._home_activity.setStyleSheet(
-            "background:#050505;color:#aaa;border:1px solid #272727;"
-            "border-radius:4px;padding:9px;"
-        )
-        self._home_activity.setPlaceholderText("Acciones, búsquedas y eventos recientes.")
-        av.addWidget(self._home_activity,1)
-        rv.addWidget(activity,1)
+        self._home_activity.setFont(QFont("Menlo", 8))
+        self._home_activity.document().setMaximumBlockCount(160)
+        self._home_activity.setPlaceholderText("Aquí aparecerán acciones y eventos reales de esta sesión.")
+        activity.body.addWidget(self._home_activity, 3)
+        self._terrain = Terrain()
+        activity.body.addWidget(self._terrain, 2)
+        left.addWidget(activity, 3)
 
-        ai = QWidget()
-        ai.setMinimumHeight(145)
-        ai.setStyleSheet("background:#080808;border:1px solid #333;border-radius:6px;")
-        ai_v = QVBoxLayout(ai)
-        ai_v.setContentsMargins(11,9,11,11)
-        ait = QLabel("IA // PROVEEDORES")
-        ait.setFont(QFont("Courier New",9,QFont.Weight.Bold))
-        ait.setStyleSheet("color:#f4f4f4;background:transparent;border:none;")
-        ai_v.addWidget(ait)
+        core = Panel("KIRA CORE", "INICIANDO")
+        self._home_state = core.badge
+        self._home_core = KiraCoreV2(self._face_path, self._assistant_name.upper())
+        self._home_core.setMinimumSize(0, 0)
+        self._home_core.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
+        core.body.addWidget(self._home_core, 1)
+        center.addWidget(core, 6)
 
-        self._home_provider_status = QLabel(
-            "GEMINI LIVE   ● ACTIVE\n"
-            "GROQ FREE     ○ NOT CONFIGURED\n"
-            "PAID APIS     ○ DISABLED\n"
-            "MODE          FREE-FIRST"
-        )
-        self._home_provider_status.setFont(QFont("Courier New",8))
-        self._home_provider_status.setStyleSheet(
-            "color:#bdbdbd;background:#050505;border:1px solid #272727;padding:9px;"
-        )
-        ai_v.addWidget(self._home_provider_status)
-        rv.addWidget(ai,0)
+        briefing = Panel("DAILY BRIEFING // CONTEXTO", time.strftime("%d %b %Y").upper())
+        self._home_briefing = QTextEdit()
+        self._home_briefing.setReadOnly(True)
+        self._home_briefing.setFont(QFont("Helvetica Neue", 10))
+        self._home_briefing.setPlaceholderText("Los resultados y resúmenes que solicites aparecerán aquí.")
+        briefing.body.addWidget(self._home_briefing, 1)
+        center.addWidget(briefing, 2)
 
-        root.addWidget(left,0)
-        root.addWidget(center,1)
-        root.addWidget(right,0)
+        command = Panel("CONVERSATION // COMMAND")
+        self._home_conversation = QTextEdit()
+        self._home_conversation.setReadOnly(True)
+        self._home_conversation.setFont(QFont("Helvetica Neue", 10))
+        self._home_conversation.document().setMaximumBlockCount(50)
+        self._home_conversation.setMinimumHeight(40)
+        command.body.addWidget(self._home_conversation, 1)
+        shortcuts = QHBoxLayout()
+        for title, draft in (("Resumir", "Resume el archivo adjunto"), ("Mi día", "Ayúdame a planificar mi día con mis tareas reales"), ("Spotify", "Abre Spotify")):
+            button = QPushButton(title)
+            button.clicked.connect(lambda checked=False, text=draft: self._prepare_command(text))
+            shortcuts.addWidget(button)
+        attach = QPushButton("+ Archivo")
+        attach.clicked.connect(self._drop_zone._browse)
+        shortcuts.addWidget(attach)
+        command.body.addLayout(shortcuts)
+        row = QHBoxLayout()
+        self._home_command = QLineEdit()
+        self._home_command.setPlaceholderText("Escribe un mensaje, orden o pregunta…")
+        self._home_command.returnPressed.connect(self._send_home_command)
+        row.addWidget(self._home_command, 1)
+        send = QPushButton("↵")
+        send.setToolTip("Enviar comando")
+        send.clicked.connect(self._send_home_command)
+        row.addWidget(send)
+        command.body.addLayout(row)
+        center.addWidget(command, 3)
+
+        system = Panel("SYSTEM // LIVE", "TELEMETRÍA")
+        for title, key in (("CPU", "cpu"), ("RAM", "ram"), ("NETWORK", "net")):
+            card, value, bar = self._kira_metric_box(title)
+            setattr(self, "_home_" + key, value)
+            setattr(self, "_home_" + key + "_bar", bar)
+            chart = Sparkline()
+            chart.setMinimumHeight(12)
+            chart.setMaximumHeight(24)
+            card.layout().setSpacing(2)
+            card.layout().setContentsMargins(7, 5, 7, 5)
+            card.layout().addWidget(chart, 1)
+            self._metric_charts[key] = chart
+            system.body.addWidget(card, 1)
+        self._home_aux_status = hud_label("Batería: N/D  ·  Temperatura: N/D", 8, True)
+        self._home_aux_status.setMinimumHeight(30)
+        system.body.addWidget(self._home_aux_status)
+        right.addWidget(system, 4)
+
+        providers = Panel("AI // PROVIDERS", "CONFIGURACIÓN")
+        providers.setMinimumHeight(153)
+        self._home_provider_status = ProviderList()
+        providers.body.addWidget(self._home_provider_status, 1)
+        tools = QPushButton("Ver herramientas registradas  →")
+        tools.clicked.connect(lambda: self._switch_workspace("tools"))
+        providers.body.addWidget(tools)
+        right.addWidget(providers, 2)
+
+        files = Panel("RECENT FILES // CONTEXT", "SESIÓN")
+        self._home_files = QListWidget()
+        self._home_files.setMinimumHeight(40)
+        self._home_files.setWordWrap(True)
+        self._home_files.itemClicked.connect(self._select_context_item)
+        files.body.addWidget(self._home_files, 1)
+        files.body.addWidget(hud_label("Solo archivos adjuntados por ti.", 8, True))
+        right.addWidget(files, 2)
+        for widget in (self._home_activity, self._home_conversation, self._home_briefing, self._home_files):
+            widget.setMinimumSize(0, 0)
+            widget.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         return page
+
+    def _prepare_command(self, text):
+        self._home_command.setText(text)
+        self._home_command.setFocus()
+
+    def _route_ui_log(self, text):
+        low = str(text).strip().lower()
+        if low.startswith(("sys:", "err:", "net:", "file:", "tool:", "task:", "[system]", "[tool", "[file", "[web]")):
+            self._home_activity_append(text)
+        else:
+            self._log.append_log(text)
+            self._home_conversation_append(text)
+
+    def _home_conversation_append(self, text: str) -> None:
+        try:
+            raw = str(text or "").strip()
+            low = raw.lower()
+            if low.startswith(("sys:", "err:", "net:", "file:", "tool:", "task:", "[system]", "[tool]")):
+                return
+            if hasattr(self, "_home_conversation"):
+                self._home_conversation.moveCursor(self._home_conversation.textCursor().MoveOperation.End)
+                self._home_conversation.insertPlainText(raw + "\n")
+                cursor = self._home_conversation.textCursor()
+                cursor.movePosition(cursor.MoveOperation.End)
+                self._home_conversation.setTextCursor(cursor)
+        except Exception:
+            pass
+
+    def _home_activity_append(self, text: str) -> None:
+        """Keep HOME activity focused on events and tool/system operations."""
+        try:
+            raw = str(text or "").strip()
+            low = raw.lower()
+            event = low.startswith(("sys:", "err:", "net:", "file:", "tool:", "task:", "[system]", "[tool", "[file", "[web]"))
+            if not event:
+                return
+            from core.tool_feedback import EventSummary
+            if not hasattr(self, '_event_summary'):
+                self._event_summary = EventSummary()
+            raw = self._event_summary.format(raw)
+            if raw is None:
+                return
+            self._home_activity.moveCursor(self._home_activity.textCursor().MoveOperation.End)
+            self._home_activity.insertPlainText(time.strftime("%H:%M:%S") + "  " + raw + "\n")
+            cursor = self._home_activity.textCursor()
+            cursor.movePosition(cursor.MoveOperation.End)
+            self._home_activity.setTextCursor(cursor)
+        except Exception:
+            pass
+
+    def _send_home_command(self) -> None:
+        text = self._home_command.text().strip()
+        if not text:
+            return
+        self._home_command.clear()
+        self._input.setText(text)
+        self._send(source='home')
+
 
     def _build_real_system_page(self) -> QWidget:
         page = QWidget()
@@ -3575,7 +3644,7 @@ class MainWindow(QMainWindow):
                 setattr(self, attr_lbl, lbl)
                 setattr(self, attr_bar, bar)
                 row.addWidget(card)
-            lay.addLayout(row)
+            lay.addLayout(row, 2)
 
         detail_row = QHBoxLayout()
 
@@ -3623,9 +3692,193 @@ class MainWindow(QMainWindow):
         rv.addWidget(self._sys_runtime)
         detail_row.addWidget(runtime)
 
-        lay.addLayout(detail_row)
-        lay.addStretch()
+        lay.addLayout(detail_row, 1)
+        status = Panel("DISPOSITIVOS // SESIÓN")
+        self._sys_devices = hud_label("Consultando estado…", 10, True)
+        status.body.addWidget(self._sys_devices, 1)
+        lay.addWidget(status, 1)
         return page
+
+    def _build_tools_page(self) -> QWidget:
+        page = Panel("TOOLS // CAPABILITIES", "REGISTRO")
+        self._tools_count = page.badge
+        self._tools_list = QTextEdit()  # retained read-only text summary for accessibility
+        self._tools_list.hide()
+        self._tools_cards = []
+        self._tool_signature = None
+        self._tools_grid = QGridLayout()
+        self._tools_grid.setSpacing(10)
+        container = QWidget()
+        container.setLayout(self._tools_grid)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(container)
+        page.body.addWidget(scroll, 1)
+        self._refresh_tools_page()
+        return page
+
+    @staticmethod
+    def _tool_category(name):
+        name = name.lower()
+        for category, words in (("COMUNICACIÓN", ("whatsapp", "message")), ("ARCHIVOS", ("file", "document")),
+                                ("NAVEGADOR", ("browser", "web", "youtube", "search")), ("VISIÓN", ("screen", "camera", "vision")),
+                                ("SISTEMA", ("system", "computer", "desktop", "app"))):
+            if any(word in name for word in words): return category
+        return "ASISTENTE"
+
+    def _refresh_tools_page(self) -> None:
+        if not hasattr(self, "_tools_grid"): return
+        try:
+            records = self.get_tools() if self.get_tools else []
+        except Exception:
+            records = []
+        records = [r for r in records if isinstance(r, dict) and r.get("name")]
+        signature = tuple((str(r["name"]), str(r.get("description", ""))) for r in records)
+        if signature == self._tool_signature: return
+        self._tool_signature = signature
+        self._clear_layout(self._tools_grid)
+        self._tools_cards = []
+        self._tools_count.setText(f"{len(records)} REGISTRADAS" if self.get_tools else "ESPERANDO MOTOR")
+        if not records:
+            empty = hud_label("El catálogo aparecerá cuando el motor publique sus herramientas registradas. No se ejecuta ninguna herramienta desde esta vista.", 11, True)
+            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._tools_grid.addWidget(empty, 0, 0)
+            return
+        for i, record in enumerate(sorted(records, key=lambda r: (self._tool_category(r['name']), r['name']))):
+            name = str(record['name'])
+            from core.tool_catalog import presentation
+            title, detail, example = presentation(name)
+            card = Panel(title.upper(), self._tool_category(name))
+            description = hud_label(detail + '\n\nEjemplo: «' + example + '»', 10, True)
+            card.body.addWidget(description, 1)
+            card.body.addWidget(hud_label("Registrada · disponibilidad al ejecutar", 8, True))
+            button = QPushButton("Preparar consulta  →")
+            button.clicked.connect(lambda checked=False, e=example: self._draft_in_chat(e))
+            card.body.addWidget(button)
+            self._tools_grid.addWidget(card, i // 2, i % 2)
+            self._tools_cards.append((name.lower() + ' ' + title.lower() + ' ' + detail.lower(), card))
+        self._filter_tools(self._nav_search.text() if hasattr(self, "_nav_search") else "")
+
+    def _filter_tools(self, text):
+        for name, card in self._tools_cards:
+            card.setVisible(str(text).lower() in name)
+
+    def _draft_in_chat(self, text):
+        self._switch_workspace("chat")
+        self._input.setText(text)
+        self._input.setFocus()
+
+    def _build_knowledge_page(self) -> QWidget:
+        page = Panel("KNOWLEDGE // CONTEXTO", "ARCHIVOS DE ESTA SESIÓN")
+        split = QSplitter(Qt.Orientation.Horizontal)
+        library = Panel("DOCUMENTOS // IMÁGENES")
+        self._context_files = QListWidget()
+        self._context_files.itemClicked.connect(self._select_context_item)
+        library.body.addWidget(self._context_files, 1)
+        attach = QPushButton("+ Adjuntar archivo")
+        attach.clicked.connect(self._drop_zone._browse)
+        library.body.addWidget(attach)
+        split.addWidget(library)
+        detail = Panel("CONTEXTO ACTIVO")
+        self._knowledge_recent = QTextEdit()
+        self._knowledge_recent.setReadOnly(True)
+        self._knowledge_recent.setPlainText("No hay un archivo de contexto cargado.\n\nAdjunta un documento o imagen para empezar.")
+        self._context_preview = QLabel()
+        self._context_preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._context_preview.setMaximumHeight(230)
+        self._context_preview.hide()
+        detail.body.addWidget(self._context_preview)
+        detail.body.addWidget(self._knowledge_recent, 1)
+        self._context_actions = []
+        row = QHBoxLayout()
+        for title, action in (("Resumir", "Resume"), ("Analizar", "Analiza"), ("Extraer puntos", "Extrae los puntos clave de"), ("Preguntar", "Quiero preguntar sobre")):
+            button = QPushButton(title)
+            button.clicked.connect(lambda checked=False, a=action: self._knowledge_command(a))
+            button.setEnabled(False)
+            self._context_actions.append(button)
+            row.addWidget(button)
+        detail.body.addLayout(row)
+        clear = QPushButton("Quitar contexto activo")
+        clear.clicked.connect(self._knowledge_clear)
+        detail.body.addWidget(clear)
+        detail.body.addWidget(hud_label("Vista previa local. Las acciones preparan una consulta; envíala cuando esté lista.", 9, True))
+        split.addWidget(detail)
+        split.setStretchFactor(0, 1); split.setStretchFactor(1, 3)
+        page.body.addWidget(split, 1)
+        return page
+
+    def _knowledge_select(self):
+        self._drop_zone._browse()
+
+    def _select_context_item(self, item):
+        path = item.data(Qt.ItemDataRole.UserRole)
+        if path and Path(path).is_file():
+            self._current_file = path
+            self._drop_zone._current_file = path
+            self._drop_zone._canvas.update()
+            self._refresh_context()
+
+    def _refresh_context(self):
+        if hasattr(self, '_chat_context_side'):
+            self._chat_context_side.setVisible(bool(self._current_file))
+        for widget in (self._context_files, self._home_files):
+            widget.clear()
+            for path in self._attached_files:
+                p = Path(path)
+                try: size = _fmt_size(p.stat().st_size)
+                except OSError: size = "no disponible"
+                active = "● " if path == self._current_file else "○ "
+                item = QListWidgetItem(active + p.name + "  ·  " + size)
+                item.setData(Qt.ItemDataRole.UserRole, path)
+                widget.addItem(item)
+        for button in self._context_actions:
+            button.setEnabled(bool(self._current_file))
+        self._context_preview.hide()
+        self._context_preview.clear()
+        if not self._current_file:
+            self._knowledge_recent.setPlainText("No hay un archivo de contexto cargado.\n\nSelecciona un adjunto o carga un archivo.")
+            self._file_hint.setText("Sin contexto activo")
+            return
+        p = Path(self._current_file)
+        self._file_hint.setTextFormat(Qt.TextFormat.PlainText)
+        self._file_hint.setText("Contexto activo: " + p.name)
+        try:
+            info = f"ARCHIVO ACTIVO\n{p.name}\n{p.suffix.upper() or 'Sin extensión'}  ·  {_fmt_size(p.stat().st_size)}\n\n"
+            if p.suffix.lower() in ('.txt', '.md', '.csv', '.py', '.log'):
+                with p.open('r', encoding='utf-8', errors='replace') as f:
+                    info += "VISTA PREVIA LOCAL (hasta 8.000 caracteres)\n\n" + f.read(8000)
+            elif p.suffix.lower() in ('.jpg', '.jpeg', '.png', '.webp', '.bmp'):
+                from PyQt6.QtGui import QImageReader
+                reader = QImageReader(str(p))
+                size = reader.size()
+                if size.isValid():
+                    size.scale(640, 220, Qt.AspectRatioMode.KeepAspectRatio)
+                    reader.setScaledSize(size)
+                    image = reader.read()
+                    if not image.isNull():
+                        self._context_preview.setPixmap(QPixmap.fromImage(image))
+                        self._context_preview.show()
+                info += "Imagen seleccionada. El análisis se solicita desde CHAT."
+            else:
+                info += "Vista previa no disponible para este formato. Puedes pedir un análisis en CHAT."
+            self._knowledge_recent.setPlainText(info)
+        except OSError:
+            self._knowledge_recent.setPlainText("El archivo ya no está disponible. Selecciona otro adjunto.")
+
+    def _knowledge_clear(self):
+        self._current_file = None
+        self._drop_zone.clear_file()
+        self._refresh_context()
+
+    def _knowledge_command(self, action):
+        if self._current_file and Path(self._current_file).is_file():
+            self._draft_in_chat(f"{action} el archivo adjunto: {Path(self._current_file).name}")
+
+    def _knowledge_summarize(self):
+        self._knowledge_command("Resume")
+
+    def _knowledge_analyze(self):
+        self._knowledge_command("Analiza")
 
     # === KIRA_WORKSPACE_V2_TASKS_HOTFIX ===
     def _tasks_file(self) -> Path:
@@ -3669,79 +3922,67 @@ class MainWindow(QMainWindow):
             elif child is not None:
                 self._clear_layout(child)
 
-    def _render_kira_tasks(self) -> None:
-        if not hasattr(self, "_tasks_list_layout"):
-            return
-        self._clear_layout(self._tasks_list_layout)
+    @staticmethod
+    def _task_bucket(task):
+        if task.get("done"): return "COMPLETADAS"
+        status = str(task.get("status", "pending")).lower()
+        if status in ("cancelled", "canceled"): return "CANCELADAS"
+        if status in ("running", "in_progress"): return "EN CURSO"
+        return "PENDIENTES"
 
-        pending = [t for t in self._kira_tasks if not t.get("done")]
-        done = [t for t in self._kira_tasks if t.get("done")]
+    def _render_home_tasks(self):
+        tasks = [t for t in self._kira_tasks if not t.get("done")]
+        signature = repr(tasks)
+        if signature == getattr(self, '_home_task_signature', None): return
+        self._home_task_signature = signature
+        self._clear_layout(self._home_task_list)
+        self._home_pending_preview.setVisible(not tasks)
+        self._home_pending_count.setText(str(len(tasks)))
+        for task in tasks[:4]:
+            card = QWidget()
+            card.setStyleSheet("background:#11151a; border:1px solid #303741; border-radius:3px;")
+            row = QHBoxLayout(card)
+            text = hud_label(str(task.get('text', '')), 10)
+            row.addWidget(text, 1)
+            done = QPushButton("✓")
+            done.setMaximumWidth(30)
+            done.clicked.connect(lambda checked=False, tid=task.get('id'): self._complete_kira_task(tid))
+            row.addWidget(done)
+            self._home_task_list.addWidget(card)
+        self._home_task_list.addStretch(1)
 
-        if hasattr(self, "_tasks_pending_count"):
-            self._tasks_pending_count.setText(f"{len(pending)} PENDIENTES")
-
-        if not self._kira_tasks:
-            empty = QLabel("No tienes pendientes.\nDile a KIRA: “tengo que…” o agrégalo aquí.")
-            empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            empty.setFont(QFont("Courier New", 10))
-            empty.setStyleSheet(
-                f"color:{C.TEXT_MED}; background:{C.DARK}; "
-                f"border:1px dashed {C.BORDER}; padding:24px;"
-            )
-            self._tasks_list_layout.addWidget(empty)
-            self._tasks_list_layout.addStretch()
-            return
-
-        for task in pending + done:
-            row = QWidget()
-            row.setStyleSheet(
-                f"background:{C.PANEL}; border:1px solid {C.BORDER}; border-radius:4px;"
-            )
-            h = QHBoxLayout(row)
-            h.setContentsMargins(10, 8, 10, 8)
-            h.setSpacing(8)
-
-            done_state = bool(task.get("done"))
-            icon = QLabel("✓" if done_state else "○")
-            icon.setFixedWidth(24)
-            icon.setAlignment(Qt.AlignmentFlag.AlignCenter)
-            icon.setFont(QFont("Courier New", 14, QFont.Weight.Bold))
-            icon.setStyleSheet(
-                f"color:{C.TEXT_DIM if done_state else C.WHITE}; "
-                f"background:transparent; border:none;"
-            )
-            h.addWidget(icon)
-
-            txt = QLabel(str(task.get("text", "")))
-            txt.setWordWrap(True)
-            txt.setFont(QFont("Courier New", 10))
-            txt.setStyleSheet(
-                f"color:{C.TEXT_DIM if done_state else C.WHITE}; "
-                f"background:transparent; border:none;"
-            )
-            h.addWidget(txt, 1)
-
-            tid = task.get("id")
-
-            if not done_state:
-                done_btn = QPushButton("✓  HECHO")
-                done_btn.setFixedHeight(40)
-                done_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-                done_btn.clicked.connect(
-                    lambda _=False, x=tid: self._complete_kira_task(x)
-                )
-                h.addWidget(done_btn)
-
-            del_btn = QPushButton("×")
-            del_btn.setFixedSize(30, 30)
-            del_btn.clicked.connect(
-                lambda _=False, x=tid: self._delete_kira_task(x)
-            )
-            h.addWidget(del_btn)
-
-            self._tasks_list_layout.addWidget(row)
-
-        self._tasks_list_layout.addStretch()
+    def _render_kira_tasks(self):
+        if not hasattr(self, '_tasks_columns'): return
+        for column in self._tasks_columns.values(): self._clear_layout(column)
+        groups = {key: [] for key in self._tasks_columns}
+        for task in self._kira_tasks:
+            if isinstance(task, dict): groups[self._task_bucket(task)].append(task)
+        self._tasks_pending_count.setText(f"{len(groups['PENDIENTES'])} PENDIENTES")
+        for name, tasks in groups.items():
+            column = self._tasks_columns[name]
+            if not tasks:
+                empty = hud_label("Sin tareas en este estado", 10, True)
+                empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                column.addWidget(empty, 1)
+            for task in tasks:
+                card = Panel(str(task.get('text', '')), '')
+                stamp = str(task.get('completed') or task.get('created') or '')
+                card.body.addWidget(hud_label(stamp, 8, True))
+                progress = task.get('progress')
+                if isinstance(progress, (int, float)) and not isinstance(progress, bool) and 0 <= progress <= 100:
+                    bar = QProgressBar(); bar.setValue(int(progress)); card.body.addWidget(bar)
+                row = QHBoxLayout()
+                if not task.get('done'):
+                    done = QPushButton("Completar")
+                    done.clicked.connect(lambda checked=False, tid=task.get('id'): self._complete_kira_task(tid))
+                    row.addWidget(done)
+                delete = QPushButton("Eliminar")
+                delete.clicked.connect(lambda checked=False, tid=task.get('id'): self._delete_kira_task(tid))
+                row.addWidget(delete)
+                card.body.addLayout(row)
+                column.addWidget(card)
+            if tasks: column.addStretch(1)
+        self._render_home_tasks()
 
     def _normalize_task_text(self, text: str) -> str:
         text = str(text or "").strip()
@@ -3802,7 +4043,7 @@ class MainWindow(QMainWindow):
             mtime = p.stat().st_mtime if p.exists() else 0
             if mtime != getattr(self, "_tasks_last_mtime", None):
                 self._tasks_last_mtime = mtime
-                fresh = self._load_kira_tasks()
+                fresh = [t for t in self._load_kira_tasks() if isinstance(t, dict)]
                 if fresh != getattr(self, "_kira_tasks", []):
                     self._kira_tasks = fresh
                     self._render_kira_tasks()
@@ -3911,22 +4152,21 @@ class MainWindow(QMainWindow):
 
         outer.addLayout(add_row)
 
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.Shape.NoFrame)
-        scroll.setStyleSheet("background:transparent; border:none;")
+        board = QGridLayout()
+        self._tasks_columns = {}
+        for i, name in enumerate(("PENDIENTES", "EN CURSO", "COMPLETADAS", "CANCELADAS")):
+            panel = Panel(name)
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            container = QWidget()
+            column = QVBoxLayout(container)
+            self._tasks_columns[name] = column
+            scroll.setWidget(container)
+            panel.body.addWidget(scroll, 1)
+            board.addWidget(panel, i // 2, i % 2)
+        outer.addLayout(board, 1)
 
-        container = QWidget()
-        container.setStyleSheet("background:transparent;")
-
-        self._tasks_list_layout = QVBoxLayout(container)
-        self._tasks_list_layout.setContentsMargins(0, 0, 0, 0)
-        self._tasks_list_layout.setSpacing(8)
-
-        scroll.setWidget(container)
-        outer.addWidget(scroll, 1)
-
-        self._kira_tasks = self._load_kira_tasks()
+        self._kira_tasks = [t for t in self._load_kira_tasks() if isinstance(t, dict)]
         QTimer.singleShot(0, self._render_kira_tasks)
 
         return page
@@ -3982,6 +4222,22 @@ class MainWindow(QMainWindow):
         put("_sys_temp", "_sys_temp_bar",
             "SENSOR N/D" if temp < 0 else f"{temp:.0f}°C", temp_pct)
 
+        for name, value in (("cpu", cpu), ("ram", ram), ("net", net)):
+            chart = self._metric_charts.get(name)
+            if chart: chart.sample(value)
+        try:
+            battery = psutil.sensors_battery()
+            battery_text = f"{battery.percent:.0f}%" + (" · cargando" if battery.power_plugged else "") if battery else "N/D"
+        except Exception:
+            battery_text = "N/D"
+        try:
+            from memory.config_manager import get_input_device, get_output_device
+            audio = "Entrada configurada: " + str(get_input_device() or "Predeterminada") + "\nSalida configurada: " + str(get_output_device() or "Predeterminada")
+        except Exception:
+            audio = "Dispositivos de audio: información no disponible"
+        self._sys_devices.setText("Batería: " + battery_text + "\n" + audio + "\nKIRA: " + str(self.hud.state) + "\nMicrófono UI: " + ("silenciado" if self._muted else "habilitado") + "\nRemote: " + ("control conectado" if self.on_remote_clicked else "sin control conectado"))
+        self._home_aux_status.setText("Batería: " + battery_text + "\nTemperatura: " + (f"{temp:.0f}°C" if temp >= 0 else "N/D"))
+
         try:
             usage = psutil.disk_usage(str(Path.home()))
             self._sys_disk.setText(f"{usage.percent:.0f}% USADO")
@@ -4023,21 +4279,13 @@ class MainWindow(QMainWindow):
             pending = [t for t in self._kira_tasks if not t.get("done")]
             if hasattr(self, "_home_pending_count"):
                 self._home_pending_count.setText(str(len(pending)))
-            if hasattr(self, "_home_pending_preview"):
-                if pending:
-                    preview = "\n".join(
-                        f"○ {t.get('text','')}" for t in pending[:7]
-                    )
-                    if len(pending) > 7:
-                        preview += f"\n+ {len(pending)-7} más"
-                else:
-                    preview = "Sin pendientes."
-                self._home_pending_preview.setText(preview)
+            self._render_home_tasks()
         except Exception:
             pass
 
     def _mirror_kira_state(self, state: str) -> None:
         try:
+            self._chat_processing.setText({'THINKING': 'KIRA está procesando…', 'SPEAKING': 'KIRA está respondiendo…'}.get(str(state).upper(), ''))
             self._home_core.state = state
             self._home_core.update()
             self._home_state.setText("●  " + str(state).upper())
@@ -4096,12 +4344,15 @@ class MainWindow(QMainWindow):
                 )
 
     def start_camera_stream(self) -> None:
+        if getattr(self, '_camera_thread', None) and self._camera_thread.is_alive():
+            return
         self._cam_stop.clear()
         self._cam_stream_sig.emit(True)
-        t = threading.Thread(target=self._cam_loop, daemon=True, name="cam-stream")
-        t.start()
+        self._camera_thread = threading.Thread(target=self._cam_loop, daemon=True, name="cam-stream")
+        self._camera_thread.start()
 
     def _cam_loop(self) -> None:
+        cap = None
         try:
             import cv2
             # Reuse camera index detected by screen_processor (cached in api_keys.json)
@@ -4118,21 +4369,26 @@ class MainWindow(QMainWindow):
                 backend = 0
             cap = cv2.VideoCapture(cam_idx, backend)
             if not cap.isOpened():
+                cap.release()
                 cap = cv2.VideoCapture(0)
             if not cap.isOpened():
                 return
             # warm-up frames
             for _ in range(5):
                 cap.read()
-            while not self._cam_stop.wait(0.033) and cap.isOpened():
+            duration = max(10, min(20, float(cfg.get('camera_session_seconds', 15)))) if isinstance(locals().get('cfg'), dict) else 15
+            deadline = time.monotonic() + duration
+            while time.monotonic() < deadline and not self._cam_stop.wait(0.05) and cap.isOpened():
                 ret, frame = cap.read()
                 if ret and frame is not None:
-                    _, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
-                    self._cam_frame_sig.emit(buf.tobytes())
-            cap.release()
+                    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 65])
+                    if ok:
+                        self._cam_frame_sig.emit(buf.tobytes())
         except Exception as e:
             print(f"[Camera] Stream error: {e}")
         finally:
+            if cap is not None:
+                cap.release()
             self._cam_stream_sig.emit(False)
 
     def stop_camera_stream(self) -> None:
@@ -4582,7 +4838,7 @@ class MainWindow(QMainWindow):
     # === KIRA_NAV_METHOD_FIX_V1 ===
     def _build_app_nav(self) -> QWidget:
         bar = QWidget()
-        bar.setFixedHeight(58)
+        bar.setFixedHeight(42)
         bar.setStyleSheet(
             f"background:{C.PANEL}; "
             f"border-top:1px solid {C.BORDER}; "
@@ -4597,12 +4853,12 @@ class MainWindow(QMainWindow):
 
         def add_btn(label: str, mode: str):
             b = QPushButton(label)
-            b.setMinimumHeight(58)
+            b.setMinimumHeight(42)
             b.setSizePolicy(
                 QSizePolicy.Policy.Expanding,
                 QSizePolicy.Policy.Expanding
             )
-            b.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+            b.setFont(QFont("Menlo", 8, QFont.Weight.Bold))
             b.setCursor(Qt.CursorShape.PointingHandCursor)
             b.setStyleSheet(
                 f"QPushButton {{"
@@ -4620,27 +4876,46 @@ class MainWindow(QMainWindow):
             lay.addWidget(b, 1)
             self._kira_nav_buttons[mode] = b
 
-        add_btn("INICIO", "home")
-        add_btn("SISTEMA", "system")
-        add_btn("KIRA", "kira")
-        add_btn("TAREAS", "tasks")
+        add_btn("HOME", "home")
         add_btn("CHAT", "chat")
+        add_btn("TASKS", "tasks")
+        add_btn("SYSTEM", "system")
+        add_btn("TOOLS", "tools")
+        add_btn("HUB", "knowledge")
+        add_btn("SETTINGS", "settings")
         return bar
 
     def _switch_workspace(self, mode: str) -> None:
+        from core.personal_store import PersonalStore
+        from core.intent_context import publish_ui
+        if mode != 'knowledge':
+            publish_ui(PersonalStore(), domain='')
         pages = {
             "home": 0,
             "system": 1,
             "kira": 2,
             "tasks": 3,
             "chat": 4,
+            "tools": 5,
+            "knowledge": 6,
+            "settings": 7,
         }
 
         stack = getattr(self, "_workspace_stack", None)
         if stack is None:
             return
 
-        current = mode if mode in pages else "home"
+        if mode == "settings":
+            self._drawer_btn.setChecked(True)
+            self._workspace_stack.setCurrentIndex(pages["settings"])
+            self._quick_drawer.show()
+            current = "settings"
+        else:
+            current = mode if mode in pages else "home"
+            if hasattr(self, "_quick_drawer"):
+                self._quick_drawer.hide()
+            if hasattr(self, "_drawer_btn"):
+                self._drawer_btn.setChecked(False)
         stack.setCurrentIndex(pages[current])
 
         for name, btn in getattr(self, "_kira_nav_buttons", {}).items():
@@ -4661,68 +4936,39 @@ class MainWindow(QMainWindow):
 
     def _build_header(self) -> QWidget:
         w = QWidget()
-        w.setFixedHeight(54)
-        w.setStyleSheet(f"background: {C.DARK}; border-bottom: 1px solid {C.BORDER_B};")
+        w.setFixedHeight(58)
+        w.setStyleSheet(HUD_STYLE)
         lay = QHBoxLayout(w)
-        lay.setContentsMargins(16, 0, 16, 0)
-
-        def _badge(txt, color=C.TEXT_MED):
-            l = QLabel(txt)
-            l.setFont(QFont("Courier New", 8))
-            l.setStyleSheet(f"color: {color}; background: transparent;")
-            return l
-
-        lay.addWidget(_badge(APP_VERSION, C.PRI_DIM))
-        lay.addSpacing(8)
+        lay.setContentsMargins(10, 0, 10, 0)
+        lay.setSpacing(8)
+        self._title_lbl = QLabel("KIRA")
+        self._sub_lbl = QLabel("")
+        self._title_lbl.hide()
+        self._sub_lbl.hide()
         self._drawer_btn = QPushButton("⚙")
-        self._drawer_btn.setFixedSize(26, 26)
-        self._drawer_btn.setFont(QFont("Courier New", 11))
-        self._drawer_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._drawer_btn.setToolTip("Settings & Controls")
-        self._drawer_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: transparent; color: {C.TEXT_DIM};
-                border: 1px solid {C.BORDER}; border-radius: 4px;
-            }}
-            QPushButton:hover {{ color: {C.PRI}; border-color: {C.PRI_DIM}; }}
-            QPushButton:checked {{ color: {C.PRI}; border-color: {C.PRI}; background: {C.PRI_GHO}; }}
-        """)
         self._drawer_btn.setCheckable(True)
+        self._drawer_btn.setFixedSize(29,29)
+        self._drawer_btn.setToolTip("Configuración")
         self._drawer_btn.clicked.connect(self._toggle_drawer)
         lay.addWidget(self._drawer_btn)
-        lay.addStretch()
-
-        mid = QVBoxLayout(); mid.setSpacing(1)
-        _disp = self._assistant_name.upper()
-        self._title_lbl = QLabel(_disp)
-        self._title_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._title_lbl.setFont(QFont("Courier New", 17, QFont.Weight.Bold))
-        self._title_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
-        mid.addWidget(self._title_lbl)
-        _sub_text = ("Personal Intelligence System"
-                     if _disp in ("JARVIS", "J.A.R.V.I.S")
-                     else "Personal AI Assistant")
-        self._sub_lbl = QLabel(_sub_text)
-        self._sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._sub_lbl.setFont(QFont("Courier New", 7))
-        self._sub_lbl.setStyleSheet(f"color: {C.PRI_DIM}; background: transparent;")
-        mid.addWidget(self._sub_lbl)
-        lay.addLayout(mid)
-        lay.addStretch()
-
-        right_col = QVBoxLayout(); right_col.setSpacing(2)
-        self._clock_lbl = QLabel("00:00:00")
-        self._clock_lbl.setFont(QFont("Courier New", 14, QFont.Weight.Bold))
-        self._clock_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
-        self._clock_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        right_col.addWidget(self._clock_lbl)
-        self._date_lbl = QLabel("")
-        self._date_lbl.setFont(QFont("Courier New", 7))
-        self._date_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
-        self._date_lbl.setAlignment(Qt.AlignmentFlag.AlignRight)
-        right_col.addWidget(self._date_lbl)
-        lay.addLayout(right_col)
+        self._nav_search = QLineEdit()
+        self._nav_search.setMaximumWidth(150)
+        self._nav_search.setPlaceholderText("Buscar herramienta…")
+        self._nav_search.textChanged.connect(self._search_tools)
+        lay.addWidget(self._nav_search)
+        clock = QVBoxLayout()
+        self._clock_lbl = hud_label("00:00:00", 10)
+        self._date_lbl = hud_label("", 7, True)
+        clock.addWidget(self._clock_lbl); clock.addWidget(self._date_lbl)
+        lay.addLayout(clock)
         return w
+
+    def _search_tools(self, text):
+        if not hasattr(self, "_tools_cards"):
+            return
+        if text.strip():
+            self._switch_workspace("tools")
+        self._filter_tools(text)
 
     def _tick_clock(self):
         self._clock_lbl.setText(time.strftime("%H:%M:%S"))
@@ -4801,71 +5047,42 @@ class MainWindow(QMainWindow):
         return w
     def _build_right_panel(self) -> QWidget:
         w = QWidget()
-        w.setFixedWidth(_RIGHT_W)
-        w.setStyleSheet(f"background: {C.DARK}; border-left: 1px solid {C.BORDER};")
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(6)
-
-        def _sec(txt):
-            l = QLabel(f"▸ {txt}")
-            l.setFont(QFont("Courier New", 7, QFont.Weight.Bold))
-            l.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
-            return l
-
-        lay.addWidget(_sec("CONVERSATION // ACTIVITY"))
+        w.setStyleSheet(HUD_STYLE)
+        root = QHBoxLayout(w)
+        root.setContentsMargins(0, 0, 0, 0)
+        chat = Panel("CONVERSACIÓN", "SESIÓN ACTUAL")
         self._log = KiraChatFeed(self._assistant_name)
-        lay.addWidget(self._log, stretch=1)
-
-        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
-        sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
-        lay.addWidget(sep)
-
-        lay.addWidget(_sec("TOOLS // FILE INPUT"))
+        self._log.setMinimumWidth(0)
+        chat.body.addWidget(self._log, 1)
+        chat.body.addLayout(self._build_input_row())
+        controls = QHBoxLayout()
+        attach = QPushButton('+ Adjuntar archivo')
+        attach.clicked.connect(lambda:self._drop_zone._browse())
+        controls.addWidget(attach)
+        controls.addStretch(1)
+        chat.body.addLayout(controls)
+        root.addWidget(chat, 3)
+        side = Panel("CONTEXTO // CONTROLES")
         self._drop_zone = FileDropZone()
         self._drop_zone.file_selected.connect(self._on_file_selected)
-        lay.addWidget(self._drop_zone)
-
-        self._file_hint = QLabel("No file loaded — drop or click above to upload")
-        self._file_hint.setFont(QFont("Courier New", 7))
-        self._file_hint.setStyleSheet(f"color: {C.TEXT_MED}; background: transparent;")
-        self._file_hint.setWordWrap(True)
-        lay.addWidget(self._file_hint)
-
-        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.HLine)
-        sep2.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
-        lay.addWidget(sep2)
-
-        lay.addWidget(_sec("CONVERSATION // COMMAND"))
-        lay.addLayout(self._build_input_row())
-
-        self._interrupt_btn = QPushButton("✋  INTERRUPT  [ESC]")
-        self._interrupt_btn.setFixedHeight(34)
-        self._interrupt_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        self._interrupt_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._interrupt_btn.setStyleSheet(f"""
-            QPushButton {{
-                background: #140008; color: {C.MUTED_C};
-                border: 1px solid {C.MUTED_C}; border-radius: 3px;
-            }}
-            QPushButton:hover {{
-                background: #200010; border: 1px solid #ff6688;
-            }}
-            QPushButton:pressed {{
-                background: #300018;
-            }}
-        """)
+        self._drop_zone.file_cleared.connect(self._knowledge_clear)
+        side.body.addWidget(self._drop_zone)
+        self._file_hint = hud_label("Sin contexto activo", 10, True)
+        side.body.addWidget(self._file_hint)
+        inspect = QPushButton("Documentos en HUB  →")
+        inspect.clicked.connect(lambda: self._switch_workspace("knowledge"))
+        side.body.addWidget(inspect)
+        side.body.addStretch(1)
+        self._interrupt_btn = QPushButton("Interrumpir respuesta  [ESC]")
         self._interrupt_btn.clicked.connect(self._do_interrupt)
-        lay.addWidget(self._interrupt_btn)
-
-        self._mute_btn = QPushButton("🎙  MICROPHONE ACTIVE")
-        self._mute_btn.setFixedHeight(30)
-        self._mute_btn.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
-        self._mute_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        controls.addWidget(self._interrupt_btn)
+        self._mute_btn = QPushButton("Micrófono")
         self._mute_btn.clicked.connect(self._toggle_mute)
         self._style_mute_btn()
-        lay.addWidget(self._mute_btn)
-
+        controls.addWidget(self._mute_btn)
+        root.addWidget(side, 1)
+        self._chat_context_side = side
+        side.hide()
         return w
 
     def _build_quick_drawer(self) -> QWidget:
@@ -5007,10 +5224,54 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self._open_plugin_settings)
         lay.addWidget(settings_btn)
 
-        w.adjustSize()
+        while lay.count():
+            lay.takeAt(0)
+        hdr.hide()
+        hdr.deleteLater()
+        sections = (
+            ("REMOTE // MOBILE", "Vinculación del teléfono y acceso remoto", [remote_btn]),
+            ("AUDIO // VOZ", "Dispositivos y activación por voz", [audio_btn, self._wake_btn, self._wake_sleep_btn]),
+            ("INICIO // AUTOMATIZACIÓN", "Preferencias de inicio y briefing", [self._autostart_btn, self._brief_btn, sc_btn]),
+            ("APARIENCIA // IDENTIDAD", "Personalización y modo de pantalla", [cust_btn, fs_btn]),
+            ("MEMORIA // PRIVACIDAD", "Revisa la memoria desde el control existente", [mem_btn]),
+            ("HABILIDADES // PLUGINS", "Gestiona extensiones y sus opciones", [plugin_btn, settings_btn]),
+        )
+        grid = QGridLayout()
+        grid.setSpacing(10)
+        for i, (title, detail, buttons) in enumerate(sections):
+            card = Panel(title)
+            card.body.addWidget(hud_label(detail, 9, True))
+            for button in buttons:
+                button.setMinimumHeight(32)
+                button.setMaximumHeight(38)
+                button.setFont(QFont("Menlo", 9))
+                card.body.addWidget(button)
+            card.body.addStretch(1)
+            grid.addWidget(card, i // 2, i % 2)
+        provider_card = Panel("IA // PROVEEDORES", "ESTADO")
+        self._settings_providers = hud_label("Consultando configuración…", 9, True)
+        provider_card.body.addWidget(self._settings_providers)
+        provider_card.body.addWidget(hud_label("Las credenciales no se muestran en esta página. La ruta de voz se mantiene en Gemini Live.", 9, True))
+        grid.addWidget(provider_card, 3, 0, 1, 2)
+        for row in range(4): grid.setRowStretch(row, 1)
+        for col in range(2): grid.setColumnStretch(col, 1)
+        content = QWidget()
+        content.setLayout(grid)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(content)
+        lay.addWidget(scroll, 1)
+        w.setStyleSheet(HUD_STYLE)
         return w
 
     def _toggle_drawer(self, checked: bool):
+        if hasattr(self, "_workspace_stack") and self._workspace_stack.currentIndex() != 7:
+            self._switch_workspace("settings")
+            return
+        if hasattr(self, "_workspace_stack") and self._workspace_stack.currentIndex() == 7:
+            self._drawer_btn.setChecked(True)
+            self._quick_drawer.show()
+            return
         if checked:
             self._refresh_wake_btns()   # resolve wake state on open (lazy)
             self._position_quick_drawer()
@@ -5022,10 +5283,12 @@ class MainWindow(QMainWindow):
     def _position_quick_drawer(self):
         if not hasattr(self, '_quick_drawer'):
             return
+        if self._quick_drawer.parentWidget() == self._settings_page:
+            return
         _W = 220
         self._quick_drawer.setFixedWidth(_W)
         self._quick_drawer.adjustSize()
-        self._quick_drawer.setGeometry(12, 54, _W, self._quick_drawer.sizeHint().height())
+        self._quick_drawer.setGeometry(12, 40, _W, self._quick_drawer.sizeHint().height())
 
     def _build_input_row(self) -> QHBoxLayout:
         row = QHBoxLayout(); row.setSpacing(5)
@@ -5185,21 +5448,16 @@ class MainWindow(QMainWindow):
         return w
 
     def _on_file_selected(self, path: str):
-        self._current_file = path
-        p    = Path(path)
-        cat  = _file_category(p)
-        icon, _ = _FILE_ICONS.get(cat, _FILE_ICONS["unknown"])
-        size = _fmt_size(p.stat().st_size)
-        self._file_hint.setText(f"{icon}  {p.name}  ·  {size}  ·  Tell {self._assistant_name} what to do with it")
-        self._log.append_log(f"FILE: {p.name} ({size}) loaded")
-        if self.on_text_command:
-            msg = (
-                f"[FILE_UPLOADED] path={path} | name={p.name} | "
-                f"type={p.suffix.lstrip('.')} | size={size} | "
-                f"Briefly tell the user you can see the file '{p.name}' "
-                f"({size}) has been uploaded and ask what they'd like to do with it."
-            )
-            threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
+        p = Path(path)
+        if not p.is_file():
+            self._route_ui_log("ERR: El archivo seleccionado no está disponible")
+            return
+        self._current_file = str(p)
+        self._drop_zone._current_file = str(p)
+        if str(p) not in self._attached_files:
+            self._attached_files.insert(0, str(p))
+        self._refresh_context()
+        self._route_ui_log(f"FILE: Adjunto cargado: {p.name}")
 
     def notify_phone_connected(self) -> None:
         if self._remote_overlay and self._remote_overlay.isVisible():
@@ -5665,6 +5923,9 @@ class MainWindow(QMainWindow):
             self.on_interrupt()
 
     def _toggle_mute(self):
+        from core.runtime_config import VOICE_ENABLED
+        if not VOICE_ENABLED:
+            return
         self._muted = not self._muted
         self.hud.muted = self._muted
         self._style_mute_btn()
@@ -5676,6 +5937,11 @@ class MainWindow(QMainWindow):
             self._log.append_log("SYS: Microphone active.")
 
     def _style_mute_btn(self):
+        from core.runtime_config import VOICE_ENABLED
+        if not VOICE_ENABLED:
+            self._mute_btn.setText('MODO TEXTO · VOZ DESACTIVADA')
+            self._mute_btn.setEnabled(False)
+            return
         if self._muted:
             self._mute_btn.setText("🔇  MICROPHONE MUTED")
             self._mute_btn.setStyleSheet(f"""
@@ -5694,21 +5960,20 @@ class MainWindow(QMainWindow):
                 QPushButton:hover {{ background: #001f10; }}
             """)
 
-    def _send(self):
+    def _send(self, checked=False, source="chat"):
         txt = self._input.text().strip()
         if not txt:
             return
 
         self._input.clear()
         try:
-            self._log.append_log(f"You: {txt}")
+            self._route_ui_log(f"You: {txt}")
         except Exception:
             pass
 
-        # Todo, incluidos pendientes, pasa por Gemini Live.
-        # Así se conserva la MISMA voz configurada de KIRA.
+        # All textual requests use the shared dispatcher; audio is independent.
         if self.on_text_command:
-            threading.Thread(target=self.on_text_command, args=(txt,), daemon=True).start()
+            threading.Thread(target=self.on_text_command, args=(txt,), kwargs={"source":source}, daemon=True).start()
 
     def _apply_state(self, state: str):
         self.hud.state    = state
@@ -5830,6 +6095,14 @@ class JarvisUI:
         self._win._confirm_hide_sig.emit()
 
     @property
+    def get_tools(self):
+        return self._win.get_tools
+
+    @get_tools.setter
+    def get_tools(self, cb):
+        self._win.get_tools = cb
+
+    @property
     def get_plugins(self):
         return self._win.get_plugins
 
@@ -5875,6 +6148,7 @@ class JarvisUI:
         GIL, so no signal/lock is needed for this cosmetic value."""
         try:
             self._win.hud.set_audio_level(level)
+            self._win._home_core.set_audio_level(level)
         except Exception:
             pass
 
@@ -5886,6 +6160,17 @@ class JarvisUI:
 
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
+
+    @property
+    def get_runtime_status(self):
+        return getattr(self._win, 'get_runtime_status', None)
+
+    @get_runtime_status.setter
+    def get_runtime_status(self, callback):
+        self._win.get_runtime_status = callback
+
+    def refresh_tasks(self):
+        self._win._tasks_refresh_sig.emit()
 
     def wait_for_api_key(self):
         while not self._win._ready:
