@@ -296,6 +296,70 @@ class ReasoningCore:
         return None
 
     @staticmethod
+    def _local_memory_plan(text: str, capabilities: list[dict]) -> dict | None:
+        """Handle explicit memory language locally and safely.
+
+        These commands are deterministic: the user explicitly asks KIRA to
+        remember, recall, or forget something. They must not require a remote
+        interpreter just to make personal memory usable offline.
+        """
+        names = {str(cap.get("name")) for cap in capabilities if isinstance(cap, dict)}
+        if "user_memory" not in names:
+            return None
+        original = " ".join(str(text).strip().split())
+        low = original.casefold()
+        remember_markers = ("recuerda que ", "acuérdate que ", "acuerdate que ", "memoriza que ", "guarda que ")
+        marker = next((item for item in remember_markers if item in low), None)
+        if marker:
+            content = original[low.find(marker) + len(marker):].strip(" .")
+            if not content:
+                return None
+            content_low = content.casefold()
+            if any(word in content_low for word in ("café", "cafe", "coffee")):
+                topic = "coffee_preference"
+            elif any(word in content_low for word in ("idioma", "lenguaje", "programación", "programacion")):
+                topic = "language_preference"
+            elif "me llamo" in content_low or "mi nombre" in content_low:
+                topic = "name"
+            else:
+                topic = "personal_note"
+            return {
+                "goal": "guardar un recuerdo personal",
+                "steps": [{"tool": "user_memory", "arguments": {
+                    "action": "remember", "category": "preferences", "topic": topic,
+                    "content": content, "source": "user_explicit"}}],
+                "needs_clarification": False, "clarification": "",
+                "response": "Lo recordaré.",
+            }
+        recall_markers = ("qué recuerdas", "que recuerdas", "qué recuerdas de", "que recuerdas de")
+        if any(item in low for item in recall_markers):
+            query = original
+            for item in recall_markers:
+                query = query.replace(item, "")
+                query = query.replace(item.capitalize(), "")
+            query = query.strip(" ¿?.,") or ""
+            return {
+                "goal": "consultar recuerdos personales",
+                "steps": [{"tool": "user_memory", "arguments": {"action": "recall", "query": query}}],
+                "needs_clarification": False, "clarification": "",
+                "response": "",
+            }
+        forget_markers = ("olvida que ", "olvida mi ", "olvida el ", "olvida la ")
+        marker = next((item for item in forget_markers if item in low), None)
+        if marker:
+            subject = original[low.find(marker) + len(marker):].strip(" .")
+            subject_low = subject.casefold()
+            topic = "coffee_preference" if any(word in subject_low for word in ("café", "cafe", "coffee")) else "personal_note"
+            return {
+                "goal": "olvidar un recuerdo personal",
+                "steps": [{"tool": "user_memory", "arguments": {
+                    "action": "forget", "category": "preferences", "topic": topic}}],
+                "needs_clarification": False, "clarification": "",
+                "response": "Lo olvidaré.",
+            }
+        return None
+
+    @staticmethod
     def _is_retry_request(text: str) -> bool:
         normalized = " ".join(str(text).casefold().split())
         return any(cue in normalized for cue in (
@@ -365,8 +429,14 @@ class ReasoningCore:
             memories = self.memory.context(text) if self.memory is not None else []
             prompt_context = {"source": source, "operational": operational, "memories": memories}
             self.context.turn("user", text)
+            local_plan = self._local_memory_plan(text, capabilities)
+            if local_plan is not None:
+                plan = local_plan
+            else:
+                plan = None
             try:
-                plan = self._provider_plan(text, prompt_context, capabilities)
+                if plan is None:
+                    plan = self._provider_plan(text, prompt_context, capabilities)
             except Exception as exc:
                 if dry_run:
                     offline_plan = self._offline_dry_run_plan(text, capabilities)

@@ -127,6 +127,23 @@ class NaturalConversationTests(unittest.TestCase):
         self.assertEqual(confirmed.state, "verified")
         self.assertEqual(len(registry.calls), 1)
 
+    def test_memory_commands_work_offline_without_provider(self):
+        from actions.user_memory import TOOL
+        from core.action_loader import ActionRecord, ActionRegistry
+
+        record = ActionRecord(name=TOOL["name"], description=TOOL["description"],
+                              parameters=TOOL["parameters"], handler=TOOL["handler"], valid=True)
+        registry = ActionRegistry({TOOL["name"]: record}, lambda _message: None)
+        with tempfile.TemporaryDirectory() as td:
+            dispatcher = TextDispatcher(base_dir=Path(td), registry=registry, provider=NaturalProvider(),
+                                        memory_path=Path(td) / "offline.db", principal="mac:tester")
+            saved = dispatcher.dispatch("Recuerda que prefiero el café con azúcar", source="chat")
+            recalled = dispatcher.dispatch("¿Qué recuerdas del café?", source="chat")
+        self.assertEqual(saved.state, "verified")
+        self.assertIn("Lo recordaré", saved.text)
+        self.assertEqual(recalled.state, "verified")
+        self.assertIn("café", recalled.text)
+
 
 if __name__ == "__main__":
     unittest.main()
