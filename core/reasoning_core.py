@@ -16,6 +16,8 @@ import time
 from typing import Any, Callable
 
 from .operational_context import OperationalContext, use_context
+from .operation_policy import classify_operation, confirmation_summary
+from .tool_contract import normalize_tool_result
 
 
 MAX_STEPS = 8
@@ -386,19 +388,27 @@ class ReasoningCore:
             "no", "cancela", "cancelar", "no lo hagas", "mejor no", "deténlo", "detenlo",
         }
 
-    @staticmethod
-    def _requires_confirmation(plan: dict) -> bool:
-        if plan.get("requires_confirmation") is True:
-            return True
-        destructive = {"delete", "remove", "erase", "overwrite", "shutdown", "restart", "send", "reply", "message"}
+    def _tool_metadata(self, name: str) -> dict:
+        getter = getattr(self.registry, "metadata", None)
+        if callable(getter):
+            try:
+                value = getter(name)
+                return value if isinstance(value, dict) else {}
+            except Exception:
+                return {}
+        return {}
+
+    def _confirmation_for_plan(self, plan: dict) -> tuple[bool, str]:
         for step in plan.get("steps", []):
-            tool = str(step.get("tool", "")).casefold()
-            args = json.dumps(step.get("arguments", {}), ensure_ascii=False).casefold()
-            if tool in {"whatsapp_web", "send_message"} and any(word in args for word in {"send", "reply", "message", "enviar", "responder"}):
-                return True
-            if tool in {"file_controller", "computer_control", "computer_settings"} and any(word in args for word in destructive):
-                return True
-        return False
+            tool = str(step.get("tool", ""))
+            arguments = step.get("arguments", {})
+            if not isinstance(arguments, dict):
+                continue
+            decision = classify_operation(tool, arguments, self._tool_metadata(tool))
+            if decision.confirmation_required:
+                prompt = plan.get("confirmation_prompt") or confirmation_summary(tool, arguments, decision)
+                return True, str(prompt)
+        return False, ""
 
     def dispatch(self, text: str, *, source: str = "chat", dry_run: bool = False) -> DispatchResult:
         text = str(text or "").strip()
@@ -411,7 +421,7 @@ class ReasoningCore:
                 if isinstance(plan, dict):
                     self.context.turn("user", text)
                     self.context.update(pending_operation=None)
-                    return self._execute(plan, str(pending.get("original_text") or text))
+                    return self._execute(plan, str(pending.get("original_text") or text), confirmed=True)
             if self._is_decline(text):
                 self.context.turn("user", text)
                 self.context.update(pending_operation=None, last_tool_result={"state": "cancelled", "text": "Operación cancelada."})
@@ -462,8 +472,9 @@ class ReasoningCore:
                 preview = json.dumps(plan, ensure_ascii=False, indent=2)
                 return DispatchResult("planned", preview, plan.get("goal", text), plan,
                                       needs_clarification=plan["needs_clarification"])
-            if self._requires_confirmation(plan):
-                prompt = plan.get("confirmation_prompt") or "¿Confirmas que ejecute esta operación?"
+            needs_confirmation, confirmation_prompt = self._confirmation_for_plan(plan)
+            if needs_confirmation:
+                prompt = confirmation_prompt or "¿Confirmas que ejecute esta operación?"
                 self.context.update(
                     last_user_goal=plan.get("goal", text),
                     pending_operation={"goal": plan.get("goal", text), "plan": plan,
@@ -487,7 +498,7 @@ class ReasoningCore:
             return self._execute(plan, text)
 
     def _execute(self, plan: dict, original_text: str, *, start_index: int = 0,
-                 prior_outputs: list[Any] | None = None) -> DispatchResult:
+                 prior_outputs: list[Any] | None = None, confirmed: bool = False) -> DispatchResult:
         context = self.context.snapshot()
         outputs: list[Any] = list(prior_outputs or [])
         results: list[ToolResult] = []
@@ -503,8 +514,22 @@ class ReasoningCore:
                     args = resolve_reference(step["arguments"], context, outputs, item)
                     cap = next((c for c in self.capabilities() if c.get("name") == step["tool"]), None)
                     validate_arguments(args, (cap or {}).get("parameters", {}))
+                    decision = classify_operation(step["tool"], args, self._tool_metadata(step["tool"]))
+                    if decision.confirmation_required and not confirmed:
+                        prompt = confirmation_summary(step["tool"], args, decision)
+                        self.context.update(
+                            pending_operation={"goal": plan.get("goal", original_text), "plan": plan,
+                                               "original_text": original_text, "confirmation_required": True,
+                                               "created_at": time.time()},
+                        )
+                        self.context.turn("assistant", prompt)
+                        return DispatchResult("pending", prompt, plan.get("goal", original_text), plan,
+                                              results, needs_clarification=True)
                     raw = self.registry.run(step["tool"], args, {"operational_context": self.context, "source_text": original_text})
                     result = self._normalize_result(step["tool"], raw)
+                    result.data = result.data if result.data is not None else {}
+                    if isinstance(result.data, dict):
+                        result.data.setdefault("policy", decision.as_dict())
                     results.append(result)
                     self.context.update(last_tool_result=result.as_dict())
                     if result.state in {"failed", "pending"}:
@@ -540,19 +565,15 @@ class ReasoningCore:
 
     @staticmethod
     def _normalize_result(tool: str, raw: Any) -> ToolResult:
-        if isinstance(raw, ToolResult):
-            return raw
-        if isinstance(raw, dict):
-            state = str(raw.get("state", "executed"))
-            text = str(raw.get("text", raw.get("result", "")))
-            data = raw.get("data")
-            verified = bool(raw.get("verified", state == "verified"))
-            return ToolResult(tool, state, text, data, verified, str(raw.get("error", "")))
-        text = str(raw or "Done.")
-        lowered = text.casefold()
-        failed = any(marker in lowered for marker in ("error", "failed", "falló", "no pude", "no se pudo", "timeout"))
-        state = "failed" if failed else "executed"
-        return ToolResult(tool, state, text, None, False, text if failed else "")
+        normalized = normalize_tool_result(tool, raw)
+        return ToolResult(
+            tool=normalized.tool,
+            state=normalized.state,
+            text=normalized.text,
+            data=normalized.data,
+            verified=normalized.verified,
+            error=normalized.error,
+        )
 
     def _update_resource_context(self, result: ToolResult) -> None:
         data = result.data

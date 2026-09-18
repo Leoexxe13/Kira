@@ -49,6 +49,7 @@ class ActionRecord:
     file: str = ""
     valid: bool = False
     error: str = ""
+    metadata: dict = field(default_factory=dict)
 
 
 class ActionRegistry:
@@ -63,6 +64,10 @@ class ActionRegistry:
             {"name": rec.name, "description": rec.description, "parameters": rec.parameters}
             for rec in self._actions.values()
         ]
+
+    def metadata(self, name: str) -> dict:
+        rec = self._actions.get(name)
+        return dict(rec.metadata) if rec is not None else {}
 
     def has(self, name: str) -> bool:
         return name in self._actions
@@ -123,8 +128,15 @@ def _validate(module, filename: str) -> ActionRecord:
         return ActionRecord(name=name, file=filename,
                             error="TOOL['handler'] missing or not callable.")
 
+    metadata = {
+        "risk": str(tool.get("risk", "")).casefold(),
+        "confirmation_required": bool(tool.get("confirmation_required", False)),
+        "read_only": bool(tool.get("read_only", False)),
+        "source_file": filename,
+    }
     return ActionRecord(name=name, description=description.strip(), parameters=parameters,
-                        handler=handler, file=filename, valid=True, error="")
+                        handler=handler, file=filename, valid=True, error="",
+                        metadata=metadata)
 
 
 def discover_actions(actions_dir: Path, reserved_names: set[str] | None = None,
