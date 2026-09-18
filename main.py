@@ -422,6 +422,34 @@ class JarvisLive:
             logger=lambda msg: print(f"[Actions] {msg}"),
         )
 
+        # Text reasoning is layered onto the stable Live runtime. It owns only
+        # semantic text planning, local memory, and operational references;
+        # voice, UI, and WhatsApp remain on their existing paths for now.
+        try:
+            import getpass
+            from core.operational_context import OperationalContext
+            from core.provider_manager import ProviderManager
+            from core.text_dispatcher import TextDispatcher
+            from memory.sqlite_memory import MemoryStore
+            principal = f"local-os:{getpass.getuser()}"
+            self._semantic_context = OperationalContext()
+            self._memory_store = MemoryStore(_base_dir / "memory" / "kira_memory.db", principal=principal)
+            self._text_dispatcher = TextDispatcher(
+                base_dir=_base_dir,
+                registry=self._action_registry,
+                provider=ProviderManager(),
+                context=self._semantic_context,
+                memory=self._memory_store,
+                logger=lambda msg: print(f"[Reasoning] {msg}"),
+            )
+            self._reasoning_core = self._text_dispatcher.core
+        except Exception as e:
+            self._semantic_context = None
+            self._memory_store = None
+            self._text_dispatcher = None
+            self._reasoning_core = None
+            print(f"[Reasoning] Disabled: {e}")
+
         # Plugins must not collide with either an inline tool or a discovered action.
         _core_names = _inline_names | self._action_registry.names()
         self._plugin_registry = discover_plugins(
@@ -679,6 +707,39 @@ class JarvisLive:
             except Exception: pass
             self.ui.set_state('LISTENING')
 
+    def _semantic_text_request_v1(self, raw: str) -> bool:
+        """Route selected natural-language tasks through the new core.
+
+        This is a small capability gate, not an intent parser. The reasoning
+        core and provider interpret the goal; ordinary conversation remains on
+        the stable Live path while this layer is hardened.
+        """
+        dispatcher = getattr(self, "_text_dispatcher", None)
+        if dispatcher is None:
+            return False
+        low = str(raw or "").casefold()
+        cues = (
+            "recuerda", "olvida", "lenguaje favorito", "idioma favorito",
+            "qué recuerdas", "que recuerdas", "encuentra el último pdf",
+            "encuentra el ultimo pdf", "último pdf", "ultimo pdf", "descargas",
+            "muévelo", "muevelo", "muévela", "muevela", "intenta otra vez",
+            "intentalo otra vez", "reintenta", "pending_operation",
+        )
+        if not any(cue in low for cue in cues):
+            return False
+        try:
+            result = dispatcher.dispatch(raw, source="chat")
+            if result.text:
+                self.ui.write_log(f"KIRA: {result.text}")
+                if self._loop:
+                    asyncio.run_coroutine_threadsafe(self._kira_voice_relay_v3(result.text), self._loop)
+            self.ui.set_state("LISTENING")
+            return True
+        except Exception as e:
+            self.ui.write_log(f"ERR: reasoning // {type(e).__name__}")
+            self.ui.set_state("LISTENING")
+            return True
+
     def _route_text_command_v1(self, text: str):
         import importlib.util
         raw=str(text or '').strip()
@@ -722,6 +783,8 @@ class JarvisLive:
         if q:
             if self._loop:
                 import asyncio; asyncio.run_coroutine_threadsafe(self._play_music_youtube_v62(q),self._loop)
+            return
+        if self._semantic_text_request_v1(raw):
             return
         if low.startswith('/gemini '):
             try:
@@ -1421,6 +1484,8 @@ class JarvisLive:
                             if full_in:
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
+                                if self._text_dispatcher:
+                                    self._text_dispatcher.observe_turn(full_in, source="voice-live")
                                 if self._dashboard:
                                     asyncio.create_task(self._dashboard.broadcast({
                                         "type": "log", "speaker": "user",

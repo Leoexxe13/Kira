@@ -1,17 +1,24 @@
 from __future__ import annotations
-import json, os, time, urllib.request, urllib.error, ssl
+
+import json
+import os
+import ssl
+import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CFG_PATH = ROOT / "config" / "providers.json"
+API_KEYS_PATH = ROOT / "config" / "api_keys.json"
 
-# KIRA_GROQ_SSL_CONTEXT_V1
 try:
     import certifi
     SSL_CONTEXT = ssl.create_default_context(cafile=certifi.where())
 except Exception:
     SSL_CONTEXT = ssl.create_default_context()
+
 
 @dataclass
 class ProviderResult:
@@ -22,7 +29,20 @@ class ProviderResult:
     latency_ms: int
     error: str = ""
 
+
+@dataclass
+class ProviderHealth:
+    state: str = "UNAVAILABLE"
+    last_success: float | None = None
+    last_error: str = ""
+    consecutive_failures: int = 0
+    cooldown_until: float = 0.0
+    latency_ms: int = 0
+
+
 class ProviderManager:
+    """Observable, bounded provider fallback for semantic interpretation."""
+
     DEFAULTS = {
         "mode": "free_first",
         "monthly_budget_usd": 0.0,
@@ -32,87 +52,218 @@ class ProviderManager:
                 "api_key": "",
                 "model": "openai/gpt-oss-20b",
                 "base_url": "https://api.groq.com/openai/v1/chat/completions",
-                "timeout_seconds": 12
+                "timeout_seconds": 10,
             },
-            "openai": {"enabled": False, "api_key": "", "paid": True},
-            "anthropic": {"enabled": False, "api_key": "", "paid": True}
-        }
+            "local": {
+                "enabled": True,
+                "base_url": "http://localhost:11434",
+                "model": "llama3.2:latest",
+                "timeout_seconds": 6,
+            },
+            "gemini": {"enabled": True, "model": "gemini-flash-latest"},
+        },
     }
+    COOLDOWNS = {"groq": 30.0, "local": 10.0, "gemini": 30.0}
 
     def __init__(self):
         self.cfg = self._load()
+        self.health = {name: ProviderHealth() for name in self.COOLDOWNS}
 
-    def _load(self):
+    def _load(self) -> dict:
         CFG_PATH.parent.mkdir(parents=True, exist_ok=True)
         if not CFG_PATH.exists():
             CFG_PATH.write_text(json.dumps(self.DEFAULTS, indent=2), encoding="utf-8")
             return json.loads(json.dumps(self.DEFAULTS))
         try:
-            cur = json.loads(CFG_PATH.read_text(encoding="utf-8"))
+            current = json.loads(CFG_PATH.read_text(encoding="utf-8"))
         except Exception:
-            cur = {}
+            current = {}
         merged = json.loads(json.dumps(self.DEFAULTS))
-        merged.update({k:v for k,v in cur.items() if k != "providers"})
-        for name, cfg in cur.get("providers", {}).items():
-            if name in merged["providers"] and isinstance(cfg, dict):
-                merged["providers"][name].update(cfg)
+        merged.update({key: value for key, value in current.items() if key != "providers"})
+        for name, values in current.get("providers", {}).items():
+            if name in merged["providers"] and isinstance(values, dict):
+                merged["providers"][name].update(values)
         return merged
 
     def reload(self):
         self.cfg = self._load()
 
-    def _groq_key(self):
-        return os.getenv("GROQ_API_KEY", "").strip() or str(
-            self.cfg["providers"]["groq"].get("api_key", "")
-        ).strip()
+    def _config(self, name: str) -> dict:
+        return self.cfg.get("providers", {}).get(name, {})
 
-    def status(self):
+    def _groq_key(self) -> str:
+        return os.getenv("GROQ_API_KEY", "").strip() or str(self._config("groq").get("api_key", "")).strip()
+
+    def _available(self, name: str) -> bool:
+        health = self.health[name]
+        return time.monotonic() >= health.cooldown_until
+
+    def _mark_success(self, name: str, latency_ms: int):
+        health = self.health[name]
+        health.state = "AVAILABLE"
+        health.last_success = time.time()
+        health.last_error = ""
+        health.consecutive_failures = 0
+        health.cooldown_until = 0.0
+        health.latency_ms = int(latency_ms or 0)
+
+    def _mark_failure(self, name: str, error: str, state: str | None = None):
+        health = self.health[name]
+        health.consecutive_failures += 1
+        health.last_error = str(error)[:240]
+        text = str(error)
+        health.state = state or ("RATE_LIMITED" if "429" in text else "DEGRADED")
+        health.cooldown_until = time.monotonic() + self.COOLDOWNS[name]
+        health.latency_ms = 0
+
+    def provider_health(self) -> dict:
+        return {name: vars(value).copy() for name, value in self.health.items()}
+
+    def status(self) -> dict:
         self.reload()
-        g = self.cfg["providers"]["groq"]
         return {
             "mode": self.cfg.get("mode", "free_first"),
             "gemini_live": True,
-            "groq": bool(g.get("enabled") and self._groq_key()),
-            "openai": False,
-            "anthropic": False,
+            "groq": bool(self._config("groq").get("enabled") and self._groq_key()),
+            "ollama": bool(self._config("local").get("enabled", True)),
+            "gemini_text": bool(self._gemini_key()),
+            "health": self.provider_health(),
         }
 
-    def ask_free(self, prompt, system=""):
-        self.reload()
-        cfg = self.cfg["providers"]["groq"]
+    def _gemini_key(self) -> str:
+        try:
+            config = json.loads(API_KEYS_PATH.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            config = {}
+        return os.getenv("GEMINI_API_KEY", "").strip() or str(config.get("gemini_api_key", "")).strip()
+
+    @staticmethod
+    def _messages(prompt: str, system: str) -> list[dict]:
+        result = []
+        if system:
+            result.append({"role": "system", "content": system})
+        result.append({"role": "user", "content": prompt})
+        return result
+
+    def ask_free(self, prompt: str, system: str = "", *, structured: bool = False) -> ProviderResult:
+        if not self._available("groq"):
+            return ProviderResult(False, "groq", "", "", 0, "Groq en cooldown temporal")
+        cfg = self._config("groq")
         key = self._groq_key()
         if not (cfg.get("enabled") and key):
             return ProviderResult(False, "groq", "", "", 0, "Groq no configurado")
-
-        messages = []
-        if system:
-            messages.append({"role":"system","content":system})
-        messages.append({"role":"user","content":prompt})
-        body = json.dumps({
+        body = {
             "model": cfg.get("model") or "openai/gpt-oss-20b",
-            "messages": messages,
-            "temperature": 0.35,
-            "max_tokens": 240
-        }).encode()
-
-        req = urllib.request.Request(
-            cfg.get("base_url") or "https://api.groq.com/openai/v1/chat/completions",
-            data=body,
-            headers={
-                "Authorization": f"Bearer {key}",
-                "Content-Type": "application/json",
-                "User-Agent": "KIRA/1.0"
-            },
-            method="POST"
+            "messages": self._messages(prompt, system),
+            "temperature": 0 if structured else 0.35,
+            "max_tokens": 1400 if structured else 240,
+        }
+        if structured:
+            body["response_format"] = {"type": "json_object"}
+        request = urllib.request.Request(
+            cfg.get("base_url") or self.DEFAULTS["providers"]["groq"]["base_url"],
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json", "User-Agent": "KIRA/1.0"},
+            method="POST",
         )
-
-        t0 = time.perf_counter()
+        started = time.perf_counter()
         try:
-            with urllib.request.urlopen(req, timeout=int(cfg.get("timeout_seconds", 12)), context=SSL_CONTEXT) as r:
-                payload = json.loads(r.read().decode())
-            text = payload["choices"][0]["message"]["content"].strip()
-            return ProviderResult(True, "groq", cfg.get("model",""), text,
-                                  int((time.perf_counter()-t0)*1000))
-        except Exception as e:
-            return ProviderResult(False, "groq", cfg.get("model",""), "",
-                                  int((time.perf_counter()-t0)*1000), str(e))
+            with urllib.request.urlopen(request, timeout=float(cfg.get("timeout_seconds", 10)), context=SSL_CONTEXT) as response:
+                payload = json.loads(response.read().decode("utf-8"))
+            text = str(payload["choices"][0]["message"].get("content") or "").strip()
+            if not text:
+                raise ValueError("empty provider response")
+            latency = int((time.perf_counter() - started) * 1000)
+            self._mark_success("groq", latency)
+            return ProviderResult(True, "groq", str(cfg.get("model", "")), text, latency)
+        except urllib.error.HTTPError as exc:
+            error = f"Groq HTTP {exc.code}"
+            self._mark_failure("groq", error, "RATE_LIMITED" if exc.code == 429 else None)
+            return ProviderResult(False, "groq", str(cfg.get("model", "")), "", int((time.perf_counter() - started) * 1000), error)
+        except Exception as exc:
+            error = f"Groq {type(exc).__name__}"
+            self._mark_failure("groq", error)
+            return ProviderResult(False, "groq", str(cfg.get("model", "")), "", int((time.perf_counter() - started) * 1000), error)
+
+    def _ask_local(self, prompt: str, system: str) -> ProviderResult:
+        if not self._available("local"):
+            return ProviderResult(False, "local", "", "", 0, "Ollama en cooldown temporal")
+        cfg = self._config("local")
+        if not cfg.get("enabled", True):
+            return ProviderResult(False, "local", "", "", 0, "Ollama no configurado")
+        url = str(cfg.get("base_url", "http://localhost:11434")).rstrip("/")
+        if not url.startswith("http://localhost:") and not url.startswith("http://127.0.0.1:"):
+            self._mark_failure("local", "local endpoint rejected", "UNAVAILABLE")
+            return ProviderResult(False, "local", "", "", 0, "Ollama local requiere localhost")
+        payload = {"model": cfg.get("model", "llama3.2:latest"), "messages": self._messages(prompt, system), "stream": False, "options": {"num_predict": 900}}
+        request = urllib.request.Request(f"{url}/api/chat", data=json.dumps(payload).encode("utf-8"), headers={"Content-Type": "application/json"}, method="POST")
+        started = time.perf_counter()
+        try:
+            with urllib.request.urlopen(request, timeout=float(cfg.get("timeout_seconds", 6))) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            text = str(data.get("message", {}).get("content") or "").strip()
+            if not text:
+                raise ValueError("empty local response")
+            latency = int((time.perf_counter() - started) * 1000)
+            self._mark_success("local", latency)
+            return ProviderResult(True, "local", str(cfg.get("model", "")), text, latency)
+        except urllib.error.HTTPError as exc:
+            error = f"Ollama HTTP {exc.code}"
+            self._mark_failure("local", error)
+            return ProviderResult(False, "local", str(cfg.get("model", "")), "", int((time.perf_counter() - started) * 1000), error)
+        except (TimeoutError, urllib.error.URLError, OSError) as exc:
+            error = f"Ollama {type(exc).__name__}"
+            self._mark_failure("local", error, "DISCONNECTED")
+            return ProviderResult(False, "local", str(cfg.get("model", "")), "", int((time.perf_counter() - started) * 1000), error)
+        except Exception as exc:
+            error = f"Ollama {type(exc).__name__}"
+            self._mark_failure("local", error)
+            return ProviderResult(False, "local", str(cfg.get("model", "")), "", int((time.perf_counter() - started) * 1000), error)
+
+    def _ask_gemini(self, prompt: str, system: str) -> ProviderResult:
+        if not self._available("gemini"):
+            return ProviderResult(False, "gemini", "", "", 0, "Gemini textual en cooldown temporal")
+        key = self._gemini_key()
+        if not key or not self._config("gemini").get("enabled", True):
+            return ProviderResult(False, "gemini", "", "", 0, "Gemini textual no configurado")
+        try:
+            from google import genai
+            from google.genai import types
+            model = self._config("gemini").get("model", "gemini-flash-latest")
+            started = time.perf_counter()
+            with genai.Client(api_key=key, http_options=types.HttpOptions(timeout=10000)) as client:
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        system_instruction=system,
+                        response_mime_type="application/json",
+                        temperature=0,
+                        max_output_tokens=1400,
+                        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+                    ),
+                )
+            text = str(response.text or "").strip()
+            if not text:
+                raise ValueError("empty Gemini response")
+            latency = int((time.perf_counter() - started) * 1000)
+            self._mark_success("gemini", latency)
+            return ProviderResult(True, "gemini", model, text, latency)
+        except Exception as exc:
+            error = f"Gemini {type(exc).__name__}"
+            self._mark_failure("gemini", error)
+            return ProviderResult(False, "gemini", "", "", 0, error)
+
+    def interpret_request(self, text: str, context: dict, capabilities: list[dict], instructions: str = "") -> ProviderResult:
+        """Try each configured interpreter at most once, without long retries."""
+        prompt = json.dumps({"input": str(text)[:2000], "context": context, "capabilities": capabilities}, ensure_ascii=False, default=str)
+        online = self.ask_free(prompt, system=instructions, structured=True)
+        if online.ok:
+            return online
+        local = self._ask_local(prompt, instructions)
+        if local.ok:
+            return local
+        gemini = self._ask_gemini(prompt, instructions)
+        if gemini.ok:
+            return gemini
+        return ProviderResult(False, "none", "", "", 0, "No hay proveedores de interpretación disponibles")
