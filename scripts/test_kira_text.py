@@ -40,6 +40,7 @@ def build_parser():
     parser.add_argument("--interactive", action="store_true", help="read sequential requests until EOF or exit")
     parser.add_argument("--dry-run", action="store_true", help="show the validated plan without executing tools")
     parser.add_argument("--state", action="store_true", help="print current context and provider state")
+    parser.add_argument("--diagnose", action="store_true", help="check provider readiness without exposing keys")
     parser.add_argument("--db", type=Path, help="SQLite memory path")
     parser.add_argument("--principal", help="trusted local principal; never supplied by the model")
     return parser
@@ -55,9 +56,12 @@ def main(argv=None):
     )
     if args.state:
         print(json.dumps(dispatcher.state(), ensure_ascii=False, indent=2, default=str))
+    if args.diagnose:
+        diagnosis = dispatcher.provider.diagnose() if hasattr(dispatcher.provider, "diagnose") else {"error": "provider has no diagnostics"}
+        print(json.dumps(diagnosis, ensure_ascii=False, indent=2, default=str))
     if args.text:
         print(json.dumps(result_payload(dispatcher.dispatch(args.text, source="cli", dry_run=args.dry_run)), ensure_ascii=False, indent=2, default=str))
-    if args.interactive or not args.text and not args.state:
+    if args.interactive or not args.text and not args.state and not args.diagnose:
         print("KIRA stage 2. Escribe una petición; usa 'salir' para terminar.", file=sys.stderr)
         while True:
             try:

@@ -331,7 +331,11 @@ class ReasoningCore:
                 "needs_clarification": False, "clarification": "",
                 "response": "Lo recordaré.",
             }
-        recall_markers = ("qué recuerdas", "que recuerdas", "qué recuerdas de", "que recuerdas de")
+        recall_markers = (
+            "qué recuerdas", "que recuerdas", "qué recuerdas de", "que recuerdas de",
+            "cómo prefiero", "como prefiero", "qué prefiero", "que prefiero",
+            "cómo tomo", "como tomo",
+        )
         if any(item in low for item in recall_markers):
             query = original
             for item in recall_markers:

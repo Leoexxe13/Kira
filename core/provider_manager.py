@@ -121,12 +121,51 @@ class ProviderManager:
 
     def status(self) -> dict:
         self.reload()
+        try:
+            import google.genai  # noqa: F401
+            gemini_sdk = True
+        except Exception:
+            gemini_sdk = False
         return {
             "mode": self.cfg.get("mode", "free_first"),
             "gemini_live": True,
             "groq": bool(self._config("groq").get("enabled") and self._groq_key()),
             "ollama": bool(self._config("local").get("enabled", True)),
             "gemini_text": bool(self._gemini_key()),
+            "gemini_sdk": gemini_sdk,
+            "health": self.provider_health(),
+        }
+
+    def diagnose(self) -> dict:
+        """Report readiness without printing or returning any secret value."""
+        self.reload()
+        local_cfg = self._config("local")
+        local_url = str(local_cfg.get("base_url", "http://localhost:11434")).rstrip("/")
+        local_reachable = False
+        local_error = ""
+        if local_cfg.get("enabled", True):
+            try:
+                with urllib.request.urlopen(f"{local_url}/api/tags", timeout=1.5):
+                    local_reachable = True
+            except Exception as exc:
+                local_error = type(exc).__name__
+        try:
+            import google.genai  # noqa: F401
+            gemini_sdk = True
+        except Exception as exc:
+            gemini_sdk = False
+            gemini_error = type(exc).__name__
+        else:
+            gemini_error = ""
+        return {
+            "groq_configured": bool(self._config("groq").get("enabled") and self._groq_key()),
+            "gemini_key_configured": bool(self._gemini_key()),
+            "gemini_sdk_installed": gemini_sdk,
+            "gemini_sdk_error": gemini_error,
+            "ollama_enabled": bool(local_cfg.get("enabled", True)),
+            "ollama_reachable": local_reachable,
+            "ollama_error": local_error,
+            "recommended": "gemini" if self._gemini_key() and gemini_sdk else ("ollama" if local_reachable else "configure_gemini_or_ollama"),
             "health": self.provider_health(),
         }
 

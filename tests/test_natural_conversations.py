@@ -139,10 +139,13 @@ class NaturalConversationTests(unittest.TestCase):
                                         memory_path=Path(td) / "offline.db", principal="mac:tester")
             saved = dispatcher.dispatch("Recuerda que prefiero el café con azúcar", source="chat")
             recalled = dispatcher.dispatch("¿Qué recuerdas del café?", source="chat")
+            natural_question = dispatcher.dispatch("¿Cómo prefiero el café?", source="chat")
         self.assertEqual(saved.state, "verified")
         self.assertIn("Lo recordaré", saved.text)
         self.assertEqual(recalled.state, "verified")
         self.assertIn("café", recalled.text)
+        self.assertEqual(natural_question.state, "verified")
+        self.assertIn("café", natural_question.text)
 
 
 if __name__ == "__main__":
