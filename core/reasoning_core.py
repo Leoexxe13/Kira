@@ -274,6 +274,28 @@ class ReasoningCore:
         return plan
 
     @staticmethod
+    def _offline_dry_run_plan(text: str, capabilities: list[dict]) -> dict | None:
+        """Explain a few safe, deterministic requests without an LLM.
+
+        This path is used only by ``dry_run``. It never executes a tool and is
+        deliberately narrow; real interpretation still belongs to a provider.
+        """
+        names = {str(cap.get("name")) for cap in capabilities if isinstance(cap, dict)}
+        low = str(text).casefold()
+        if "file_controller" not in names:
+            return None
+        if "pdf" in low and any(word in low for word in ("descarg", "download", "último", "ultimo")):
+            return {
+                "goal": "encontrar el PDF más reciente descargado",
+                "steps": [{"tool": "file_controller", "arguments": {
+                    "action": "find", "path": "downloads", "extension": ".pdf"}}],
+                "needs_clarification": False,
+                "clarification": "",
+                "response": "Plan seguro: buscar PDFs en Descargas sin ejecutar cambios.",
+            }
+        return None
+
+    @staticmethod
     def _is_retry_request(text: str) -> bool:
         normalized = " ".join(str(text).casefold().split())
         return any(cue in normalized for cue in (
@@ -346,6 +368,12 @@ class ReasoningCore:
             try:
                 plan = self._provider_plan(text, prompt_context, capabilities)
             except Exception as exc:
+                if dry_run:
+                    offline_plan = self._offline_dry_run_plan(text, capabilities)
+                    if offline_plan is not None:
+                        self.logger("semantic provider unavailable; using deterministic dry-run preview")
+                        preview = json.dumps(offline_plan, ensure_ascii=False, indent=2)
+                        return DispatchResult("planned", preview, offline_plan["goal"], offline_plan)
                 self.context.update(
                     last_user_goal=text,
                     last_tool_result={"state": "failed", "text": "semantic provider unavailable"},

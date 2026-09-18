@@ -20,6 +20,16 @@ class Provider:
         return ProviderResult(True, "fixture", "", json.dumps(self.plans.pop(0)), 1)
 
 
+class OfflineFileRegistry(FakeRegistry):
+    def get_tool_declarations(self):
+        declarations = super().get_tool_declarations()
+        declarations.append({"name": "file_controller", "description": "Find files", "parameters": {
+            "type": "OBJECT", "properties": {
+                "action": {"type": "STRING"}, "path": {"type": "STRING"}, "extension": {"type": "STRING"}},
+            "required": ["action"]}})
+        return declarations
+
+
 class TextDispatcherStage2Tests(unittest.TestCase):
     def test_dry_run_validates_plan_without_running_tool(self):
         registry = FakeRegistry()
@@ -37,6 +47,18 @@ class TextDispatcherStage2Tests(unittest.TestCase):
         self.assertEqual(registry.calls, [])
         self.assertEqual(result.plan["steps"][0]["tool"], "find_files")
         self.assertTrue(provider.calls[0]["instructions"])
+
+    def test_dry_run_shows_safe_pdf_plan_without_provider(self):
+        registry = OfflineFileRegistry()
+        with tempfile.TemporaryDirectory() as td:
+            dispatcher = TextDispatcher(
+                base_dir=Path(td), registry=registry, provider=Provider(),
+                memory_path=Path(td) / "memory.db", principal="test-user",
+            )
+            result = dispatcher.dispatch("Busca el último PDF que descargué", source="test", dry_run=True)
+        self.assertEqual(result.state, "planned")
+        self.assertEqual(registry.calls, [])
+        self.assertEqual(result.plan["steps"][0]["tool"], "file_controller")
 
     def test_sequential_dispatch_reuses_same_operational_context(self):
         registry = FakeRegistry()

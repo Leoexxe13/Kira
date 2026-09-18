@@ -24,6 +24,8 @@ def result_payload(result):
     return {
         "state": result.state,
         "ok": result.ok,
+        "executed": bool(result.results),
+        "dry_run_plan": result.state == "planned",
         "goal": result.goal,
         "needs_clarification": result.needs_clarification,
         "text": result.text,

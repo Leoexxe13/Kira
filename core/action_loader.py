@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import importlib.util
 import inspect
+import os
 import re
 import sys
 import traceback
@@ -177,7 +178,8 @@ def discover_actions(actions_dir: Path, reserved_names: set[str] | None = None,
         except Exception as e:
             rec = ActionRecord(name=path.stem, file=path.name,
                                error=f"Failed to load: {e}")
-            traceback.print_exc()
+            if os.getenv("KIRA_ACTION_DEBUG") == "1":
+                traceback.print_exc()
 
         all_records.append(rec)
         if rec.valid:
