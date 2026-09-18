@@ -14,6 +14,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = ROOT / "config" / "api_keys.json"
+PROVIDERS = ROOT / "config" / "providers.json"
 
 
 def save_gemini_key(key: str) -> None:
@@ -33,6 +34,19 @@ def save_gemini_key(key: str) -> None:
         pass
 
 
+def configure_gemini_provider() -> None:
+    """Update only Gemini's non-secret provider settings in the local file."""
+    try:
+        data = json.loads(PROVIDERS.read_text(encoding="utf-8")) if PROVIDERS.exists() else {}
+    except (OSError, ValueError):
+        data = {}
+    providers = data.setdefault("providers", {})
+    gemini = providers.setdefault("gemini", {})
+    gemini.update({"enabled": True, "model": "gemini-2.5-flash", "timeout_seconds": 20})
+    PROVIDERS.parent.mkdir(parents=True, exist_ok=True)
+    PROVIDERS.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Configura el proveedor semántico local de KIRA")
     parser.add_argument("provider", choices=["gemini"], help="proveedor a configurar")
@@ -41,6 +55,7 @@ def main(argv=None):
         print("La clave se escribirá localmente en config/api_keys.json y no se mostrará.")
         key = getpass.getpass("Pega tu Gemini API key (entrada oculta): ")
         save_gemini_key(key)
+        configure_gemini_provider()
         print("Gemini quedó configurado. Verifica con:")
         print("  python3 scripts/test_kira_text.py --diagnose")
         print("Si google-genai no está instalado, ejecuta:")
