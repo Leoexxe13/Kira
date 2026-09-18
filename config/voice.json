@@ -1,5 +1,21 @@
 {
-  "mode": "gemini_primary_edge_fallback",
+  "schema_version": 2,
+  "mode": "auto_local_turn",
+  "whisper_binary": "vendor/whisper.cpp/build/bin/whisper-cli",
+  "whisper_model": "models/whisper/ggml-base.bin",
+  "local": {
+    "enabled": true,
+    "vad_mode": 2,
+    "start_frames": 5,
+    "end_silence_frames": 25,
+    "pre_roll_frames": 15,
+    "max_turn_seconds": 15.0,
+    "barge_in": true,
+    "whisper_threads": 4,
+    "language": "es",
+    "say_voice": "Jorge",
+    "say_rate": 190
+  },
   "edge_enabled": true,
   "edge_voice": "es-MX-JorgeNeural",
   "edge_rate": "+3%",

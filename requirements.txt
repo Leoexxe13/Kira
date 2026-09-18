@@ -3,6 +3,7 @@ PyQt6
 sounddevice
 numpy
 google-genai>=2.8.0
+webrtcvad-wheels==2.0.14
 
 # ── Web search & browser control ──────────────────────────────────────────────
 requests

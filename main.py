@@ -410,6 +410,7 @@ class JarvisLive:
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
         self._live_compat_level = 0  # 0 full, 1 no enhanced, 2 no transcripts, 3 no tools
+        self._local_voice = None
 
         _base_dir = Path(__file__).resolve().parent
         _inline_names = {t["name"] for t in TOOL_DECLARATIONS}
@@ -818,6 +819,10 @@ class JarvisLive:
         speech = str(text or "").strip()
         if not speech or getattr(self.ui, "muted", False):
             return
+        local_voice = getattr(self, "_local_voice", None)
+        if local_voice is not None:
+            await local_voice.speak_text(speech)
+            return
 
         try:
             from core.voice_manager import VoiceManager, load_config
@@ -944,6 +949,9 @@ class JarvisLive:
     def interrupt(self) -> None:
         """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
         self._interrupted = True
+        local_voice = getattr(self, "_local_voice", None)
+        if local_voice is not None:
+            local_voice.interrupt()
         # KIRA_V63_STOP_EDGE
         try:
             _vm = getattr(self, '_kira_voice_manager_v63', None)
@@ -968,7 +976,13 @@ class JarvisLive:
         self.ui.write_log("SYS: Interrupted — listening...")
 
     def speak(self, text: str):
-        if not self._loop or not self.session:
+        if not self._loop:
+            return
+        local_voice = getattr(self, "_local_voice", None)
+        if local_voice is not None:
+            asyncio.run_coroutine_threadsafe(local_voice.speak_text(text), self._loop)
+            return
+        if not self.session:
             return
         asyncio.run_coroutine_threadsafe(
             self.session.send_client_content(
@@ -2047,6 +2061,57 @@ class JarvisLive:
         except Exception as e:
             print(f"[Dashboard] Disabled: {e}")
             self._dashboard = None
+
+        # FULL STABLE voice: local turn-taking is the preferred mode. Gemini
+        # Live remains a compatibility fallback while whisper.cpp is installed
+        # and benchmarked on the target Intel Mac.
+        try:
+            from core.local_voice_runtime import (
+                LocalVoiceRuntime, MacSayOutput, WhisperCppTranscriber,
+                load_local_voice_config,
+            )
+            from core.voice_manager import load_config as _load_voice_config
+            _voice_mode = str(_load_voice_config().get("mode", "auto_local_turn"))
+            if _voice_mode in {"local_turn", "auto_local_turn"} and self._text_dispatcher is not None:
+                _local_cfg, _whisper_bin, _whisper_model = load_local_voice_config(Path(__file__).resolve().parent)
+                _runtime = LocalVoiceRuntime(
+                    dispatcher=self._text_dispatcher,
+                    config=_local_cfg,
+                    transcriber=WhisperCppTranscriber(
+                        _whisper_bin, _whisper_model,
+                        threads=_local_cfg.whisper_threads,
+                        language=_local_cfg.language,
+                    ),
+                    output=MacSayOutput(voice=_local_cfg.say_voice, rate=_local_cfg.say_rate),
+                    logger=self.ui.write_log,
+                    state_callback=self.ui.set_state,
+                )
+                _diagnosis = _runtime.diagnose()
+                if _diagnosis["ready"]:
+                    self._local_voice = _runtime
+                    await _runtime.start(device=audio_devices.resolve(get_input_device(), "input"))
+                    self.ui.write_log("SYS: Voz local FULL STABLE activa (VAD + whisper.cpp + macOS say).")
+                    try:
+                        async with asyncio.TaskGroup() as tg:
+                            tg.create_task(self._run_system_monitor())
+                            tg.create_task(self._run_background_monitor())
+                            tg.create_task(self._run_proactive_mode())
+                            tg.create_task(self._run_sleep_watch())
+                            await asyncio.Event().wait()
+                    finally:
+                        await _runtime.stop()
+                        self._local_voice = None
+                    return
+                reason = ", ".join(key for key, value in _diagnosis.items()
+                                   if key in {"whisper_binary", "whisper_model", "tts_say"} and not value)
+                self.ui.write_log(
+                    "SYS: Voz local aún no está lista (falta: " + (reason or "dependencia") + "). "
+                    "Ejecuta scripts/setup_local_voice_macos.sh. Usando Gemini Live como compatibilidad."
+                )
+        except Exception as exc:
+            self.ui.write_log(
+                f"SYS: Voz local degradada ({type(exc).__name__}); usando Gemini Live como compatibilidad."
+            )
 
         while True:
             try:
