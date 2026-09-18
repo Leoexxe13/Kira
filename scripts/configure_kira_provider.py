@@ -50,8 +50,14 @@ def configure_gemini_provider() -> None:
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Configura el proveedor semántico local de KIRA")
     parser.add_argument("provider", choices=["gemini"], help="proveedor a configurar")
+    parser.add_argument("--update-model-only", action="store_true",
+                        help="actualiza providers.json sin solicitar ni tocar la API key")
     args = parser.parse_args(argv)
     if args.provider == "gemini":
+        if args.update_model_only:
+            configure_gemini_provider()
+            print("Modelo textual actualizado a gemini-2.5-flash; la API key no fue modificada.")
+            return 0
         print("La clave se escribirá localmente en config/api_keys.json y no se mostrará.")
         key = getpass.getpass("Pega tu Gemini API key (entrada oculta): ")
         save_gemini_key(key)
