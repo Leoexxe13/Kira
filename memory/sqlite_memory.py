@@ -15,15 +15,25 @@ import hashlib
 import json
 import re
 import secrets
+import shutil
 import sqlite3
 import time
 from typing import Iterator
 
 
 DEFAULT_PATH = Path(__file__).resolve().parent / "kira_memory.db"
+MAX_STATE_BYTES = 64 * 1024
+MAX_STATE_STRING = 2000
+MAX_STATE_DEPTH = 6
 _CREDENTIAL_RE = re.compile(
     r"(?i)(?:password|contraseña|api[_ -]?key|access[_ -]?token|secret|credential|clave)\s*[:=]\s*\S+"
     r"|\b(?:sk-|gsk_|ghp_|xoxb-|AIza)[A-Za-z0-9_\-]{12,}"
+    r"|\bBearer\s+[A-Za-z0-9._~+\-/]+=*"
+    r"|\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b"
+    r"|-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----"
+    r"|\bAKIA[0-9A-Z]{16}\b"
+    r"|https?://[^\s/:]+:[^\s/@]+@",
+    re.MULTILINE,
 )
 _SECRET_LABELS = {"password", "contraseña", "api_key", "apikey", "token", "secret", "credential", "clave"}
 _CATEGORIES = {"identity", "preferences", "projects", "relationships", "wishes", "notes"}
@@ -56,6 +66,40 @@ CREATE TABLE IF NOT EXISTS session_state (
     state TEXT NOT NULL DEFAULT '{}',
     updated_at REAL NOT NULL,
     PRIMARY KEY(user_id, session_id)
+);
+CREATE TABLE IF NOT EXISTS memory_history (
+    history_id TEXT PRIMARY KEY,
+    memory_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    topic TEXT NOT NULL,
+    content TEXT NOT NULL,
+    confidence REAL NOT NULL,
+    source TEXT NOT NULL,
+    valid_from REAL NOT NULL,
+    valid_to REAL NOT NULL,
+    status TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS memory_history_lookup_idx
+    ON memory_history(user_id, category, topic, valid_to DESC);
+CREATE TABLE IF NOT EXISTS legacy_imports (
+    user_id TEXT NOT NULL,
+    source_path TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    imported_at REAL NOT NULL,
+    imported_count INTEGER NOT NULL,
+    skipped_count INTEGER NOT NULL,
+    backup_path TEXT NOT NULL,
+    PRIMARY KEY(user_id, source_path, content_hash)
+);
+CREATE TABLE IF NOT EXISTS session_summaries (
+    id TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    summary TEXT NOT NULL,
+    language TEXT NOT NULL DEFAULT '',
+    created_at REAL NOT NULL,
+    consumed_at REAL
 );
 """
 
@@ -98,6 +142,7 @@ class MemoryStore:
         self.principal = principal.strip()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._user_id = self._ensure_user()
+        self._set_schema_version(2)
 
     @contextmanager
     def _db(self) -> Iterator[sqlite3.Connection]:
@@ -110,6 +155,8 @@ class MemoryStore:
         db.row_factory = sqlite3.Row
         try:
             db.execute("PRAGMA foreign_keys = ON")
+            db.execute("PRAGMA journal_mode = WAL")
+            db.execute("PRAGMA synchronous = NORMAL")
             db.executescript(SCHEMA)
             yield db
             db.commit()
@@ -134,6 +181,12 @@ class MemoryStore:
     @property
     def user_id(self) -> str:
         return self._user_id
+
+    def _set_schema_version(self, version: int) -> None:
+        with self._db() as db:
+            current = int(db.execute("PRAGMA user_version").fetchone()[0])
+            if current < version:
+                db.execute(f"PRAGMA user_version = {int(version)}")
 
     @staticmethod
     def _validate_text(name: str, value: str, *, max_length: int) -> str:
@@ -169,6 +222,20 @@ class MemoryStore:
         now = time.time()
         memory_id = secrets.token_hex(16)
         with self._db() as db:
+            previous = db.execute(
+                "SELECT * FROM memories WHERE user_id=? AND category=? AND topic=?",
+                (self.user_id, category, topic),
+            ).fetchone()
+            if previous and (str(previous["content"]) != content or not bool(previous["active"])):
+                db.execute(
+                    """INSERT INTO memory_history(
+                           history_id,memory_id,user_id,category,topic,content,confidence,source,
+                           valid_from,valid_to,status) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (secrets.token_hex(16), str(previous["id"]), self.user_id, category, topic,
+                     str(previous["content"]), float(previous["confidence"]), str(previous["source"]),
+                     float(previous["updated_at"]), now,
+                     "superseded" if bool(previous["active"]) else "reactivated"),
+                )
             db.execute(
                 """INSERT INTO memories(id,user_id,category,topic,content,confidence,source,created_at,updated_at,active)
                    VALUES(?,?,?,?,?,?,?,?,?,1)
@@ -207,11 +274,108 @@ class MemoryStore:
         category = self._validate_text("category", category, max_length=40).lower()
         topic = self._validate_text("topic", topic, max_length=160)
         with self._db() as db:
+            previous = db.execute(
+                "SELECT * FROM memories WHERE user_id=? AND category=? AND topic=? AND active=1",
+                (self.user_id, category, topic),
+            ).fetchone()
+            if previous:
+                now = time.time()
+                db.execute(
+                    """INSERT INTO memory_history(
+                           history_id,memory_id,user_id,category,topic,content,confidence,source,
+                           valid_from,valid_to,status) VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (secrets.token_hex(16), str(previous["id"]), self.user_id, category, topic,
+                     str(previous["content"]), float(previous["confidence"]), str(previous["source"]),
+                     float(previous["updated_at"]), now, "retracted"),
+                )
             result = db.execute(
                 "UPDATE memories SET active=0, updated_at=? WHERE user_id=? AND category=? AND topic=? AND active=1",
                 (time.time(), self.user_id, category, topic),
             )
         return result.rowcount > 0
+
+    def history(self, category: str, topic: str) -> list[dict]:
+        category = self._validate_text("category", category, max_length=40).lower()
+        topic = self._validate_text("topic", topic, max_length=160)
+        with self._db() as db:
+            rows = db.execute(
+                """SELECT category,topic,content,confidence,source,valid_from,valid_to,status
+                   FROM memory_history WHERE user_id=? AND category=? AND topic=?
+                   ORDER BY valid_to DESC""",
+                (self.user_id, category, topic),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def migrate_legacy_json(self, source_path: str | Path) -> dict:
+        """Import legacy long_term.json once per content hash, preserving a backup.
+
+        Existing active SQLite facts win on collisions. Unknown categories and
+        malformed entries are skipped and counted instead of being guessed.
+        """
+        source = Path(source_path).expanduser().resolve()
+        if not source.exists() or not source.is_file():
+            return {"state": "not_found", "imported": 0, "skipped": 0, "backup": ""}
+        raw = source.read_bytes()
+        digest = hashlib.sha256(raw).hexdigest()
+        with self._db() as db:
+            prior = db.execute(
+                "SELECT imported_count,skipped_count,backup_path FROM legacy_imports WHERE user_id=? AND source_path=? AND content_hash=?",
+                (self.user_id, str(source), digest),
+            ).fetchone()
+        if prior:
+            return {"state": "already_imported", "imported": int(prior[0]),
+                    "skipped": int(prior[1]), "backup": str(prior[2])}
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as exc:
+            raise ValueError(f"Legacy memory JSON is invalid: {type(exc).__name__}") from exc
+        if not isinstance(payload, dict):
+            raise ValueError("Legacy memory JSON must contain an object")
+        backup_dir = source.parent / "backups"
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        backup = backup_dir / f"{source.stem}.{digest[:12]}.json"
+        if not backup.exists():
+            shutil.copy2(source, backup)
+        imported = 0
+        skipped = 0
+        now = time.time()
+        with self._db() as db:
+            for category, entries in payload.items():
+                if category not in _CATEGORIES or not isinstance(entries, dict):
+                    skipped += len(entries) if isinstance(entries, (dict, list)) else 1
+                    continue
+                for topic, entry in entries.items():
+                    content = entry.get("value") if isinstance(entry, dict) else entry
+                    if not isinstance(content, str) or not content.strip():
+                        skipped += 1
+                        continue
+                    try:
+                        cat, clean_topic, clean_content, source_name, confidence = self._validate_memory(
+                            category, str(topic), content, "json_migration", 0.9,
+                        )
+                    except ValueError:
+                        skipped += 1
+                        continue
+                    exists = db.execute(
+                        "SELECT 1 FROM memories WHERE user_id=? AND category=? AND topic=? AND active=1",
+                        (self.user_id, cat, clean_topic),
+                    ).fetchone()
+                    if exists:
+                        skipped += 1
+                        continue
+                    db.execute(
+                        """INSERT INTO memories(id,user_id,category,topic,content,confidence,source,created_at,updated_at,active)
+                           VALUES(?,?,?,?,?,?,?,?,?,1)""",
+                        (secrets.token_hex(16), self.user_id, cat, clean_topic, clean_content,
+                         confidence, source_name, now, now),
+                    )
+                    imported += 1
+            db.execute(
+                """INSERT INTO legacy_imports(user_id,source_path,content_hash,imported_at,
+                   imported_count,skipped_count,backup_path) VALUES(?,?,?,?,?,?,?)""",
+                (self.user_id, str(source), digest, now, imported, skipped, str(backup)),
+            )
+        return {"state": "imported", "imported": imported, "skipped": skipped, "backup": str(backup)}
 
     def context(self, query: str = "", *, limit: int = 8, max_chars: int = 2400) -> list[dict]:
         selected: list[dict] = []
@@ -241,7 +405,11 @@ class MemoryStore:
             "pending_candidates", "last_user_goal",
         }
         filtered = {key: state[key] for key in allowed if key in state}
-        payload = json.dumps(self._redact_state(filtered), ensure_ascii=False, default=str)
+        payload = json.dumps(
+            self._redact_state(filtered, budget=[MAX_STATE_BYTES]),
+            ensure_ascii=False,
+            default=str,
+        )
         with self._db() as db:
             db.execute(
                 """INSERT INTO session_state(user_id,session_id,state,updated_at) VALUES(?,?,?,?)
@@ -265,13 +433,21 @@ class MemoryStore:
             return {}
 
     @classmethod
-    def _redact_state(cls, value):
+    def _redact_state(cls, value, *, budget: list[int] | None = None, depth: int = 0):
+        budget = budget if budget is not None else [MAX_STATE_BYTES]
+        if depth >= MAX_STATE_DEPTH or budget[0] <= 0:
+            return "[truncado]"
         if isinstance(value, str):
-            return _CREDENTIAL_RE.sub("[credencial omitida]", value)
+            clean = _CREDENTIAL_RE.sub("[credencial omitida]", value)[:MAX_STATE_STRING]
+            clean = clean[:max(0, budget[0])]
+            budget[0] -= len(clean.encode("utf-8", errors="ignore"))
+            return clean
         if isinstance(value, list):
-            return [cls._redact_state(item) for item in value[:50]]
+            return [cls._redact_state(item, budget=budget, depth=depth + 1) for item in value[:30]
+                    if budget[0] > 0]
         if isinstance(value, dict):
-            return {str(key): cls._redact_state(item) for key, item in list(value.items())[:80]}
+            return {str(key)[:120]: cls._redact_state(item, budget=budget, depth=depth + 1)
+                    for key, item in list(value.items())[:40] if budget[0] > 0}
         return value
 
     @staticmethod

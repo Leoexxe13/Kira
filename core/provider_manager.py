@@ -32,7 +32,7 @@ class ProviderResult:
 
 @dataclass
 class ProviderHealth:
-    state: str = "UNAVAILABLE"
+    state: str = "UNKNOWN"
     last_success: float | None = None
     last_error: str = ""
     consecutive_failures: int = 0
@@ -46,6 +46,7 @@ class ProviderManager:
     DEFAULTS = {
         "mode": "free_first",
         "monthly_budget_usd": 0.0,
+        "interpretation_priority": ["gemini", "groq", "local"],
         "providers": {
             "groq": {
                 "enabled": False,
@@ -117,7 +118,30 @@ class ProviderManager:
         health.latency_ms = 0
 
     def provider_health(self) -> dict:
-        return {name: vars(value).copy() for name, value in self.health.items()}
+        now = time.monotonic()
+        result = {}
+        for name, value in self.health.items():
+            row = vars(value).copy()
+            row["cooldown_remaining_seconds"] = max(0.0, round(value.cooldown_until - now, 2))
+            row["configured"] = self._is_configured(name)
+            if not row["configured"]:
+                row["state"] = "NOT_CONFIGURED"
+            elif value.cooldown_until > now:
+                row["state"] = "COOLDOWN"
+            result[name] = row
+        return result
+
+    def _is_configured(self, name: str) -> bool:
+        cfg = self._config(name)
+        if not cfg.get("enabled", True):
+            return False
+        if name == "groq":
+            return bool(self._groq_key())
+        if name == "gemini":
+            return bool(self._gemini_key())
+        if name == "local":
+            return bool(cfg.get("base_url") and cfg.get("model"))
+        return False
 
     def status(self) -> dict:
         self.reload()
@@ -296,19 +320,25 @@ class ProviderManager:
             return ProviderResult(False, "gemini", model if "model" in locals() else "", "", 0, error)
 
     def interpret_request(self, text: str, context: dict, capabilities: list[dict], instructions: str = "") -> ProviderResult:
-        """Try each configured interpreter at most once, without long retries."""
+        """Try each configured interpreter once in explicit priority order."""
         prompt = json.dumps({"input": str(text)[:2000], "context": context, "capabilities": capabilities}, ensure_ascii=False, default=str)
         failures: list[str] = []
-        online = self.ask_free(prompt, system=instructions, structured=True)
-        if online.ok:
-            return online
-        failures.append(online.error or "Groq unavailable")
-        local = self._ask_local(prompt, instructions)
-        if local.ok:
-            return local
-        failures.append(local.error or "Ollama unavailable")
-        gemini = self._ask_gemini(prompt, instructions)
-        if gemini.ok:
-            return gemini
-        failures.append(gemini.error or "Gemini unavailable")
+        runners = {
+            "gemini": lambda: self._ask_gemini(prompt, instructions),
+            "groq": lambda: self.ask_free(prompt, system=instructions, structured=True),
+            "local": lambda: self._ask_local(prompt, instructions),
+        }
+        priority = self.cfg.get("interpretation_priority") or ["gemini", "groq", "local"]
+        seen: set[str] = set()
+        for name in list(priority) + ["gemini", "groq", "local"]:
+            if name in seen or name not in runners:
+                continue
+            seen.add(name)
+            if not self._is_configured(name):
+                failures.append(f"{name}: no configurado")
+                continue
+            result = runners[name]()
+            if result.ok:
+                return result
+            failures.append(result.error or f"{name}: no disponible")
         return ProviderResult(False, "none", "", "", 0, " | ".join(failures)[:700])

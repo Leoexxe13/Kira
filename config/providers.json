@@ -1,6 +1,11 @@
 {
   "mode": "free_first",
   "monthly_budget_usd": 0.0,
+  "interpretation_priority": [
+    "gemini",
+    "groq",
+    "local"
+  ],
   "providers": {
     "groq": {
       "enabled": false,

@@ -43,6 +43,7 @@ def configure_gemini_provider() -> None:
     providers = data.setdefault("providers", {})
     gemini = providers.setdefault("gemini", {})
     gemini.update({"enabled": True, "model": "gemini-2.5-flash", "timeout_seconds": 20})
+    data["interpretation_priority"] = ["gemini", "groq", "local"]
     PROVIDERS.parent.mkdir(parents=True, exist_ok=True)
     PROVIDERS.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 

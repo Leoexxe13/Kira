@@ -176,7 +176,9 @@ class ProviderFallbackTests(unittest.TestCase):
             self.assertFalse(first.ok)
             self.assertFalse(second.ok)
             self.assertEqual(request.call_count, 1)
-            self.assertEqual(manager.provider_health()["groq"]["state"], "RATE_LIMITED")
+            health = manager.provider_health()["groq"]
+            self.assertEqual(health["state"], "COOLDOWN")
+            self.assertIn("429", health["last_error"])
 
     def test_local_success_stops_fallback(self):
         with tempfile.TemporaryDirectory() as td, patch("core.provider_manager.CFG_PATH", Path(td) / "providers.json"):
@@ -192,6 +194,8 @@ class ProviderFallbackTests(unittest.TestCase):
     def test_interpretation_falls_from_groq_to_local_once(self):
         with tempfile.TemporaryDirectory() as td, patch("core.provider_manager.CFG_PATH", Path(td) / "providers.json"):
             manager = ProviderManager()
+            manager.cfg["interpretation_priority"] = ["groq", "local", "gemini"]
+            manager.cfg["providers"]["groq"].update({"enabled": True, "api_key": "test"})
             with patch.object(manager, "ask_free", return_value=ProviderResult(False, "groq", "", "", 0, "Groq HTTP 429")) as groq, \
                  patch.object(manager, "_ask_local", return_value=ProviderResult(True, "local", "model", "{}", 2)) as local, \
                  patch.object(manager, "_ask_gemini") as gemini:
@@ -205,7 +209,10 @@ class ProviderFallbackTests(unittest.TestCase):
     def test_interpretation_reports_all_provider_failures(self):
         with tempfile.TemporaryDirectory() as td, patch("core.provider_manager.CFG_PATH", Path(td) / "providers.json"):
             manager = ProviderManager()
-            with patch.object(manager, "ask_free", return_value=ProviderResult(False, "groq", "", "", 1, "Groq no configurado")), \
+            manager.cfg["providers"]["groq"].update({"enabled": True, "api_key": "test"})
+            manager.cfg["providers"]["gemini"].update({"enabled": True})
+            with patch.object(manager, "_gemini_key", return_value="test"), \
+                 patch.object(manager, "ask_free", return_value=ProviderResult(False, "groq", "", "", 1, "Groq no configurado")), \
                  patch.object(manager, "_ask_local", return_value=ProviderResult(False, "local", "", "", 2, "Ollama URLError")), \
                  patch.object(manager, "_ask_gemini", return_value=ProviderResult(False, "gemini", "", "", 3, "Gemini ModuleNotFoundError")):
                 result = manager.interpret_request("test", {}, [], "json")
@@ -213,6 +220,17 @@ class ProviderFallbackTests(unittest.TestCase):
             self.assertIn("Groq no configurado", result.error)
             self.assertIn("Ollama URLError", result.error)
             self.assertIn("Gemini ModuleNotFoundError", result.error)
+
+    def test_configured_gemini_is_tried_before_slow_local(self):
+        with tempfile.TemporaryDirectory() as td, patch("core.provider_manager.CFG_PATH", Path(td) / "providers.json"):
+            manager = ProviderManager()
+            with patch.object(manager, "_gemini_key", return_value="test"), \
+                 patch.object(manager, "_ask_gemini", return_value=ProviderResult(True, "gemini", "model", "{}", 5)) as gemini, \
+                 patch.object(manager, "_ask_local") as local:
+                result = manager.interpret_request("test", {}, [], "json")
+            self.assertTrue(result.ok)
+            gemini.assert_called_once()
+            local.assert_not_called()
 
 
 if __name__ == "__main__":

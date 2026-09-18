@@ -435,6 +435,14 @@ class JarvisLive:
             principal = f"local-os:{getpass.getuser()}"
             self._semantic_context = OperationalContext()
             self._memory_store = MemoryStore(_base_dir / "memory" / "kira_memory.db", principal=principal)
+            legacy_memory = _base_dir / "memory" / "long_term.json"
+            migration = self._memory_store.migrate_legacy_json(legacy_memory)
+            if migration.get("state") == "imported":
+                print(
+                    "[Memory] Migrated legacy memory to SQLite "
+                    f"({migration.get('imported', 0)} imported, {migration.get('skipped', 0)} skipped). "
+                    f"Backup: {migration.get('backup', '')}"
+                )
             self._text_dispatcher = TextDispatcher(
                 base_dir=_base_dir,
                 registry=self._action_registry,
@@ -708,28 +716,14 @@ class JarvisLive:
             except Exception: pass
             self.ui.set_state('LISTENING')
 
-    def _semantic_text_request_v1(self, raw: str) -> bool:
-        """Route selected natural-language tasks through the new core.
-
-        This is a small capability gate, not an intent parser. The reasoning
-        core and provider interpret the goal; ordinary conversation remains on
-        the stable Live path while this layer is hardened.
-        """
+    def _semantic_text_request_v1(self, raw: str, *, source: str = "chat") -> bool:
+        """Route every natural-language request through KIRA's single dispatcher."""
         dispatcher = getattr(self, "_text_dispatcher", None)
         if dispatcher is None:
-            return False
-        low = str(raw or "").casefold()
-        cues = (
-            "recuerda", "olvida", "lenguaje favorito", "idioma favorito",
-            "qué recuerdas", "que recuerdas", "encuentra el último pdf",
-            "encuentra el ultimo pdf", "último pdf", "ultimo pdf", "descargas",
-            "muévelo", "muevelo", "muévela", "muevela", "intenta otra vez",
-            "intentalo otra vez", "reintenta", "pending_operation",
-        )
-        if not any(cue in low for cue in cues):
-            return False
+            self.ui.write_log("KIRA: El núcleo no está disponible. No ejecuté cambios.")
+            return True
         try:
-            result = dispatcher.dispatch(raw, source="chat")
+            result = dispatcher.dispatch(raw, source=source)
             if result.text:
                 self.ui.write_log(f"KIRA: {result.text}")
                 if self._loop:
@@ -780,18 +774,10 @@ class JarvisLive:
             if self._loop:
                 import asyncio; asyncio.run_coroutine_threadsafe(self._kira_voice_relay_v3(answer),self._loop)
             return
-        q=self._music_request_v62(raw)
-        if q:
-            if self._loop:
-                import asyncio; asyncio.run_coroutine_threadsafe(self._play_music_youtube_v62(q),self._loop)
-            return
-        if self._semantic_text_request_v1(raw):
-            return
         if low.startswith('/gemini '):
-            try:
-                from core.api_usage import record; record('gemini')
-            except Exception:pass
-            return self._on_text_command(raw[8:].strip())
+            raw = raw[8:].strip()
+            if not raw:
+                return
         if low=='/provider':
             try:
                 from core.provider_manager import ProviderManager
@@ -799,33 +785,11 @@ class JarvisLive:
                 st=ProviderManager().status(); answer=f"Gemini Live: {'activo' if st.get('gemini_live') else 'apagado'}. Groq: {'listo' if st.get('groq') else 'sin configurar'}. "+usage_text()
             except Exception as e:answer=f'No pude leer los proveedores: {e}'
             self.ui.write_log(f'KIRA: {answer}'); return
-        try:
-            from core.local_fastpath import handle; res=handle(raw)
-        except Exception as e:
-            res=None; self.ui.write_log(f'ERR: local // {e}')
-        if res is not None and getattr(res,'handled',False):
-            try:
-                from core.api_usage import record; record('local',getattr(res,'ok',True))
-            except Exception:pass
-            if getattr(res,'activity',''):self.ui.write_log(f'SYS: {res.activity}')
-            if getattr(res,'text',''):self.ui.write_log(f'KIRA: {res.text}')
-            speech=str(getattr(res,'speak','') or '').strip()
-            if speech and self._loop:
-                import asyncio; asyncio.run_coroutine_threadsafe(self._kira_voice_relay_v3(speech),self._loop)
-            return
-        if self._should_use_groq_v1(raw):
-            try:
-                from core.api_usage import record; record('groq')
-            except Exception:pass
-            prompt=raw[6:].strip() if low.startswith('/groq ') else raw
-            if self._loop:
-                import asyncio; asyncio.run_coroutine_threadsafe(self._ask_groq_and_speak_v1(prompt),self._loop)
-            else:self._on_text_command(raw)
-            return
-        try:
-            from core.api_usage import record; record('gemini')
-        except Exception:pass
-        return self._on_text_command(raw)
+        if low.startswith('/groq '):
+            raw = raw[6:].strip()
+            if not raw:
+                return
+        return self._semantic_text_request_v1(raw, source="chat")
 
 
     async def _ask_groq_and_speak_v1(self,prompt:str):
@@ -2041,23 +2005,16 @@ class JarvisLive:
                 )
                 if not text:
                     continue
-                # Wait up to 8s for session to become ready after a wake
-                for _ in range(80):
-                    if self.session:
-                        break
-                    await asyncio.sleep(0.1)
-                if self.session:
-                    # A remote command is deliberate control and the phone user
-                    # has no desktop WAKE button — so it wakes JARVIS if asleep.
-                    if self._wake_enabled and not self._awake:
-                        self.wake(reason="remote command")
-                    await self.session.send_client_content(
-                        turns={"role": "user", "parts": [{"text": text}]},
-                        turn_complete=True,
-                    )
-                    self.ui.write_log(f"[Web]: {text}")
-                else:
-                    print(f"[Dashboard] Dropped command (no session): {text}")
+                # Remote is an input transport, not a separate brain. It uses
+                # exactly the same dispatcher, memory, policy and tools as chat.
+                if self._wake_enabled and not self._awake:
+                    self.wake(reason="remote command")
+                self.ui.write_log(f"[Web]: {text}")
+                loop = asyncio.get_running_loop()
+                await loop.run_in_executor(
+                    None,
+                    lambda: self._semantic_text_request_v1(text, source="remote"),
+                )
             except asyncio.TimeoutError:
                 pass
             except Exception as e:
