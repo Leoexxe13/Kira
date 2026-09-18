@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 import json
 import math
 import re
+import secrets
 import time
 from typing import Any, Callable
 
@@ -241,11 +242,12 @@ class ReasoningCore:
     """Provider-agnostic semantic dispatcher."""
 
     def __init__(self, *, registry, provider=None, context: OperationalContext | None = None,
-                 memory=None, logger: Callable[[str], None] | None = None):
+                 memory=None, journal=None, logger: Callable[[str], None] | None = None):
         self.registry = registry
         self.provider = provider
         self.context = context or OperationalContext()
         self.memory = memory
+        self.journal = journal
         self.logger = logger or (lambda _message: None)
 
     def capabilities(self) -> list[dict]:
@@ -410,8 +412,10 @@ class ReasoningCore:
                 return True, str(prompt)
         return False, ""
 
-    def dispatch(self, text: str, *, source: str = "chat", dry_run: bool = False) -> DispatchResult:
+    def dispatch(self, text: str, *, source: str = "chat", dry_run: bool = False,
+                 request_id: str | None = None) -> DispatchResult:
         text = str(text or "").strip()
+        request_id = request_id or secrets.token_hex(16)
         if not text:
             return DispatchResult("pending", "¿Qué te gustaría que hiciera?", needs_clarification=True)
         pending = self.context.value("pending_operation")
@@ -419,9 +423,15 @@ class ReasoningCore:
             if self._is_confirmation(text):
                 plan = pending.get("plan")
                 if isinstance(plan, dict):
+                    validate_plan(plan, self.capabilities())
                     self.context.turn("user", text)
                     self.context.update(pending_operation=None)
-                    return self._execute(plan, str(pending.get("original_text") or text), confirmed=True)
+                    return self._execute(
+                        plan,
+                        str(pending.get("original_text") or text),
+                        confirmed=True,
+                        request_id=str(pending.get("request_id") or request_id),
+                    )
             if self._is_decline(text):
                 self.context.turn("user", text)
                 self.context.update(pending_operation=None, last_tool_result={"state": "cancelled", "text": "Operación cancelada."})
@@ -432,10 +442,12 @@ class ReasoningCore:
             plan = pending.get("plan")
             step_index = pending.get("step_index")
             if isinstance(plan, dict) and type(step_index) is int and 0 <= step_index < len(plan.get("steps", [])):
+                validate_plan(plan, self.capabilities())
                 self.context.turn("user", text)
                 return self._execute(
                     plan, str(pending.get("original_text") or text),
                     start_index=step_index, prior_outputs=pending.get("outputs") or [],
+                    request_id=str(pending.get("request_id") or request_id),
                 )
         capabilities = self.capabilities()
         with use_context(self.context):
@@ -479,6 +491,7 @@ class ReasoningCore:
                     last_user_goal=plan.get("goal", text),
                     pending_operation={"goal": plan.get("goal", text), "plan": plan,
                                        "original_text": text, "confirmation_required": True,
+                                       "request_id": request_id,
                                        "created_at": time.time()},
                 )
                 self.context.turn("assistant", prompt)
@@ -495,10 +508,12 @@ class ReasoningCore:
                 self.context.turn("assistant", response)
                 return DispatchResult(state, response, plan.get("goal", text), plan,
                                       needs_clarification=plan["needs_clarification"])
-            return self._execute(plan, text)
+            return self._execute(plan, text, request_id=request_id)
 
     def _execute(self, plan: dict, original_text: str, *, start_index: int = 0,
-                 prior_outputs: list[Any] | None = None, confirmed: bool = False) -> DispatchResult:
+                 prior_outputs: list[Any] | None = None, confirmed: bool = False,
+                 request_id: str = "") -> DispatchResult:
+        request_id = request_id or secrets.token_hex(16)
         context = self.context.snapshot()
         outputs: list[Any] = list(prior_outputs or [])
         results: list[ToolResult] = []
@@ -510,7 +525,7 @@ class ReasoningCore:
                     if not isinstance(items, list) or not items or len(items) > MAX_FOREACH:
                         raise PlanError("foreach has no valid bounded items")
                 step_outputs = []
-                for item in items:
+                for item_index, item in enumerate(items):
                     args = resolve_reference(step["arguments"], context, outputs, item)
                     cap = next((c for c in self.capabilities() if c.get("name") == step["tool"]), None)
                     validate_arguments(args, (cap or {}).get("parameters", {}))
@@ -520,23 +535,51 @@ class ReasoningCore:
                         self.context.update(
                             pending_operation={"goal": plan.get("goal", original_text), "plan": plan,
                                                "original_text": original_text, "confirmation_required": True,
+                                               "request_id": request_id,
                                                "created_at": time.time()},
                         )
                         self.context.turn("assistant", prompt)
                         return DispatchResult("pending", prompt, plan.get("goal", original_text), plan,
                                               results, needs_clarification=True)
-                    raw = self.registry.run(step["tool"], args, {"operational_context": self.context, "source_text": original_text})
-                    result = self._normalize_result(step["tool"], raw)
+                    operation_id = ""
+                    cached = None
+                    if self.journal is not None:
+                        operation_id = self.journal.operation_id(
+                            request_id, step_index, item_index, step["tool"], args,
+                        )
+                        should_run, cached = self.journal.reserve_operation(
+                            operation_id, request_id, step["tool"],
+                        )
+                    else:
+                        should_run = True
+                    if should_run:
+                        raw = self.registry.run(
+                            step["tool"],
+                            args,
+                            {"operational_context": self.context, "source_text": original_text,
+                             "operation_authorized": bool(confirmed), "operation_id": operation_id},
+                        )
+                        result = self._normalize_result(step["tool"], raw)
+                    else:
+                        result = self._normalize_result(step["tool"], cached or {})
                     result.data = result.data if result.data is not None else {}
                     if isinstance(result.data, dict):
                         result.data.setdefault("policy", decision.as_dict())
                     results.append(result)
+                    if self.journal is not None and operation_id and should_run:
+                        self.journal.finish_operation(
+                            operation_id,
+                            succeeded=result.state not in {"failed", "pending", "blocked"},
+                            result=result.as_dict(),
+                            error_code=result.error or result.state,
+                        )
                     self.context.update(last_tool_result=result.as_dict())
-                    if result.state in {"failed", "pending"}:
+                    if result.state in {"failed", "pending", "blocked"}:
                         self.context.update(
                             pending_operation={"goal": plan.get("goal", original_text), "plan": plan,
                                                "step_index": step_index, "original_text": original_text,
                                                "last_observation": result.as_dict(), "outputs": outputs,
+                                               "request_id": request_id,
                                                "created_at": time.time()},
                             pending_candidates=(result.data if isinstance(result.data, list) else []),
                         )
@@ -552,6 +595,7 @@ class ReasoningCore:
                     pending_operation={"goal": plan.get("goal", original_text), "plan": plan,
                                        "step_index": step_index, "original_text": original_text,
                                        "outputs": outputs,
+                                       "request_id": request_id,
                                        "created_at": time.time()},
                 )
                 return DispatchResult("failed", text, plan.get("goal", original_text), plan, results)

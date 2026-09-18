@@ -76,16 +76,28 @@ class ActionRegistry:
         return set(self._actions.keys())
 
     # -- called by main.py from _execute_tool --
-    def run(self, name: str, parameters: dict, ctx: dict | None = None) -> str:
+    def run(self, name: str, parameters: dict, ctx: dict | None = None):
         rec = self._actions.get(name)
         if rec is None or not rec.valid:
             return f"Action '{name}' is not available."
+        ctx = ctx or {}
+        from core.operation_policy import classify_operation, confirmation_summary
+        decision = classify_operation(name, parameters or {}, rec.metadata)
+        if decision.confirmation_required and ctx.get("operation_authorized") is not True:
+            return {
+                "state": "pending",
+                "verified": False,
+                "text": confirmation_summary(name, parameters or {}, decision),
+                "data": {"policy": decision.as_dict()},
+                "error": "authorization_required",
+            }
         try:
-            return _call_handler(rec.handler, parameters, ctx or {}) or "Done."
+            return _call_handler(rec.handler, parameters, ctx) or "Done."
         except Exception as e:
-            self._logger(f"Action '{name}' crashed during run(): {e}")
+            self._logger(f"Action '{name}' crashed during run(): {type(e).__name__}")
             traceback.print_exc()
-            return f"Tool '{name}' failed: {e}"
+            return {"state": "failed", "verified": False,
+                    "text": f"La acción {name} falló.", "error": type(e).__name__}
 
 
 def _call_handler(fn: Callable, parameters: dict, ctx: dict) -> str:

@@ -241,6 +241,14 @@ def send_message(
     message_text = params.get("message_text", "").strip()
     platform     = params.get("platform", "whatsapp").strip()
 
+    if any(alias in platform.casefold() for alias in ("whatsapp", "wapp", "wp")):
+        return {
+            "state": "blocked",
+            "verified": False,
+            "text": "WhatsApp sólo puede usarse mediante whatsapp_web, que verifica el chat por ID antes de enviar.",
+            "error": "exclusive_route_whatsapp_web",
+        }
+
     if not receiver:
         return "Especifica a quién quieres enviar el mensaje."
     if not message_text:
@@ -306,7 +314,8 @@ if callable(_KIRA_ORIGINAL_TOOL_HANDLER_V2):
         params = params if isinstance(params, dict) else {}
         joined = " ".join(str(v) for v in params.values()).lower()
         action = str(params.get("action", "")).lower()
-        if "web.whatsapp.com" in joined or ("whatsapp" in joined and action in {"open","abrir","new_tab","navigate","go","send","message"}):
+        platform = str(params.get("platform", "")).casefold()
+        if "web.whatsapp.com" in joined or any(alias in platform for alias in ("whatsapp", "wapp", "wp")):
             return "KIRA_ROUTE_BLOCKED: WhatsApp está reservado para whatsapp_web. No se abrió Safari, Chrome ni una app alternativa."
         return _KIRA_ORIGINAL_TOOL_HANDLER_V2(*args, **kwargs)
     TOOL["handler"] = _kira_whatsapp_route_guard_v2

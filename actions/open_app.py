@@ -82,8 +82,7 @@ def _launch_windows(app_name: str) -> bool:
     if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
         try:
             subprocess.Popen(
-                app_name,
-                shell=True,
+                [shutil.which(app_name) or shutil.which(app_name.split(".")[0])],
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
@@ -91,14 +90,6 @@ def _launch_windows(app_name: str) -> bool:
             return True
         except Exception as e:
             print(f"[open_app] subprocess failed: {e}")
-
-    if ":" in app_name:
-        try:
-            subprocess.Popen(f"start {app_name}", shell=True)
-            time.sleep(1.0)
-            return True
-        except Exception:
-            pass
 
     try:
         import pyautogui
@@ -247,6 +238,8 @@ def open_app(
 
     if not app_name:
         return "No application name provided."
+    if "whatsapp" in app_name.casefold() or "web.whatsapp.com" in app_name.casefold():
+        return "KIRA_ROUTE_BLOCKED: WhatsApp está reservado para whatsapp_web."
 
     launcher = _OS_LAUNCHERS.get(_SYSTEM)
     if launcher is None:
@@ -302,8 +295,8 @@ if callable(_KIRA_ORIGINAL_TOOL_HANDLER_V2):
         params = args[0] if args and isinstance(args[0], dict) else kwargs.get("parameters", {})
         params = params if isinstance(params, dict) else {}
         joined = " ".join(str(v) for v in params.values()).lower()
-        action = str(params.get("action", "")).lower()
-        if "web.whatsapp.com" in joined or ("whatsapp" in joined and action in {"open","abrir","new_tab","navigate","go","send","message"}):
+        app_name = str(params.get("app_name", "")).casefold()
+        if "web.whatsapp.com" in joined or "whatsapp" in app_name:
             return "KIRA_ROUTE_BLOCKED: WhatsApp está reservado para whatsapp_web. No se abrió Safari, Chrome ni una app alternativa."
         return _KIRA_ORIGINAL_TOOL_HANDLER_V2(*args, **kwargs)
     TOOL["handler"] = _kira_whatsapp_route_guard_v2

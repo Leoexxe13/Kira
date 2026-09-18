@@ -3,6 +3,9 @@ import sys
 import json
 import re
 import time
+import os
+import shutil
+import tempfile
 from pathlib import Path
 
 
@@ -71,12 +74,21 @@ def _read_file(file_path: str) -> tuple[str, str]:
 
 
 def _save_file(path: Path, content: str) -> str:
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content, encoding="utf-8")
-        return f"Saved to: {path}"
-    except Exception as e:
-        return f"Could not save: {e}"
+    path = path.expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    backup = None
+    if path.exists():
+        backup = path.with_name(f".{path.name}.kira-backup-{int(time.time())}")
+        shutil.copy2(path, backup)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent,
+                                     prefix=f".{path.name}.", delete=False) as tmp:
+        tmp.write(content)
+        tmp.flush()
+        os.fsync(tmp.fileno())
+        temp_path = Path(tmp.name)
+    os.replace(temp_path, path)
+    suffix = f" Backup: {backup}" if backup else ""
+    return f"Saved to: {path}.{suffix}"
 
 
 def _preview(code: str, lines: int = 10) -> str:
@@ -256,41 +268,13 @@ def _build(description, language, output_path, args, timeout, speak=None, player
         if speak: speak(msg)
         return msg
 
-    last_output = ""
-    for attempt in range(1, MAX_BUILD_ATTEMPTS + 1):
-        print(f"[Code] 🔄 Attempt {attempt}/{MAX_BUILD_ATTEMPTS}")
-        if player:
-            player.write_log(f"[Code] Attempt {attempt}...")
-
-        last_output = _run_file(path, args, timeout)
-
-        if not _has_error(last_output):
-            msg = (
-                f"Build complete, sir. "
-                f"The code is working after {attempt} attempt{'s' if attempt > 1 else ''}. "
-                f"Saved to {path}."
-            )
-            if speak: speak(msg)
-            return f"{msg}\n\nOutput:\n{last_output}"
-
-        print(f"[Code] ⚠️ Error on attempt {attempt}, fixing...")
-        if player:
-            player.write_log(f"[Code] Fixing (attempt {attempt})...")
-
-        try:
-            code = _fix_code(code, last_output, description)
-            _save_file(path, code)
-        except Exception as e:
-            msg = f"Could not fix code on attempt {attempt}: {e}"
-            if speak: speak(msg)
-            return msg
-
     msg = (
-        f"I was unable to build a working version after {MAX_BUILD_ATTEMPTS} attempts, sir. "
-        f"The last error was: {last_output[:200]}"
+        f"Code generated and saved to {path}. It was not executed: FULL STABLE "
+        "does not run model-generated code with the user's permissions. Review it first."
     )
-    if speak: speak(msg)
-    return f"{msg}\n\nLast code saved to: {path}"
+    if speak:
+        speak(msg)
+    return f"{msg}\n\nPreview:\n{_preview(code)}"
 
 def _write_action(description, language, output_path, player) -> str:
     if not description:
@@ -375,9 +359,10 @@ def _run_action(file_path, args, timeout, player) -> str:
     p = Path(file_path)
     if not p.exists():
         return f"File not found: {file_path}"
-    if player:
-        player.write_log(f"[Code] Running {p.name}...")
-    return _run_file(p, args, timeout)
+    return (
+        "KIRA_ROUTE_BLOCKED: direct code execution is disabled in FULL STABLE. "
+        f"Review and run {p.name} yourself in a restricted environment."
+    )
 
 
 def _optimize_action(file_path, code, language, output_path, player) -> str:
@@ -501,14 +486,7 @@ Be specific and actionable. If you see an error message, quote it exactly."""
             pass
 
         if file_path and file_content:
-
-            code_match = re.search(r"```[a-zA-Z]*\n(.*?)```", analysis, re.DOTALL)
-            if code_match:
-                fixed_code = code_match.group(1).strip()
-                save_path  = Path(file_path)
-                _save_file(save_path, fixed_code)
-                analysis += f"\n\n✅ Fixed code has been saved to: {file_path}"
-                print(f"[Code] ✅ Fixed code saved: {file_path}")
+            analysis += "\n\nNo file was changed automatically; review the suggested fix first."
 
         return analysis
 

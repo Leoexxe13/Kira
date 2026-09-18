@@ -1173,22 +1173,11 @@ class JarvisLive:
                     )
                     self.ui.write_log("SYS: Shutdown blocked — target was not KIRA.")
                 else:
-                    self.ui.write_log("SYS: Shutdown requested explicitly for KIRA.")
-                    result = "KIRA shutdown scheduled."
-                    async def _do_shutdown():
-                        await self._save_session_summary()
-                        if self.session:
-                            try:
-                                await self.session.send_client_content(
-                                    turns={"role": "user", "parts": [{"text": "Say a brief natural goodbye to the user."}]},
-                                    turn_complete=True,
-                                )
-                            except Exception:
-                                pass
-                        await asyncio.sleep(1.5)
-                        import os as _os
-                        _os._exit(0)
-                    asyncio.create_task(_do_shutdown())
+                    self.ui.write_log("SYS: Shutdown blocked — use the application Quit control.")
+                    result = (
+                        "Shutdown blocked. A model tool call cannot terminate KIRA; "
+                        "use the visible Quit control so cleanup can finish safely."
+                    )
 
             elif self._action_registry.has(name):
                 # file_processor: fall back to the currently-uploaded file when none is given

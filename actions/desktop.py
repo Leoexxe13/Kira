@@ -81,24 +81,10 @@ def _build_sandbox() -> dict:
 
 
 def _execute_generated_code(code: str, player=None) -> str:
-    if not code or code.strip() == "UNSAFE":
-        return "This action cannot be performed safely."
-
-    # Kod temizleme
-    if code.startswith("```"):
-        lines = code.split("\n")
-        code  = "\n".join(lines[1:-1]).strip()
-
-    sandbox      = _build_sandbox()
-    output_lines = []
-    sandbox["__builtins__"]["print"] = lambda *a: output_lines.append(" ".join(str(x) for x in a))
-
-    try:
-        exec(compile(code, "<jarvis_desktop>", "exec"), sandbox)
-        return "\n".join(output_lines) if output_lines else "Done."
-    except Exception as e:
-        print(f"[Desktop] Exec error: {e}\nCode:\n{code[:300]}")
-        return f"Execution error: {e}"
+    # A Python dictionary is not a security sandbox. Generated code previously
+    # had access to Path, shutil and pyautogui with the user's permissions.
+    # Stable KIRA only executes predefined, schema-validated desktop actions.
+    return "KIRA_ROUTE_BLOCKED: generated desktop code is disabled; use a registered desktop action."
 
 
 def _ask_gemini_for_desktop_action(task: str) -> str:

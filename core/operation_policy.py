@@ -45,6 +45,7 @@ _MEDIUM_ACTIONS = {
 _HIGH_ACTIONS = {
     "delete", "remove", "erase", "trash", "send", "reply", "message",
     "shutdown", "restart", "reboot", "logout", "format", "reset",
+    "run", "execute", "build", "screen_debug", "install",
 }
 _HIGH_TOOLS = {"send_message"}
 
@@ -72,6 +73,8 @@ def classify_operation(tool: str, arguments: dict[str, Any], metadata: dict | No
 
     name = str(tool or "").casefold()
     action = _action(arguments)
+    if name == "code_helper" and action in {"auto", "run", "execute", "build", "screen_debug"}:
+        return PolicyDecision(RiskLevel.HIGH, True, f"code execution or screen disclosure {name}:{action}")
     if name in _HIGH_TOOLS or action in _HIGH_ACTIONS:
         return PolicyDecision(RiskLevel.HIGH, True, f"high-impact {name}:{action or 'default'}")
     if action in _MEDIUM_ACTIONS:
