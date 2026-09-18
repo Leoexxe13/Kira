@@ -202,6 +202,18 @@ class ProviderFallbackTests(unittest.TestCase):
             local.assert_called_once()
             gemini.assert_not_called()
 
+    def test_interpretation_reports_all_provider_failures(self):
+        with tempfile.TemporaryDirectory() as td, patch("core.provider_manager.CFG_PATH", Path(td) / "providers.json"):
+            manager = ProviderManager()
+            with patch.object(manager, "ask_free", return_value=ProviderResult(False, "groq", "", "", 1, "Groq no configurado")), \
+                 patch.object(manager, "_ask_local", return_value=ProviderResult(False, "local", "", "", 2, "Ollama URLError")), \
+                 patch.object(manager, "_ask_gemini", return_value=ProviderResult(False, "gemini", "", "", 3, "Gemini ModuleNotFoundError")):
+                result = manager.interpret_request("test", {}, [], "json")
+            self.assertFalse(result.ok)
+            self.assertIn("Groq no configurado", result.error)
+            self.assertIn("Ollama URLError", result.error)
+            self.assertIn("Gemini ModuleNotFoundError", result.error)
+
 
 if __name__ == "__main__":
     unittest.main()

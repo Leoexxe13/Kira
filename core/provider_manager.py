@@ -296,13 +296,17 @@ class ProviderManager:
     def interpret_request(self, text: str, context: dict, capabilities: list[dict], instructions: str = "") -> ProviderResult:
         """Try each configured interpreter at most once, without long retries."""
         prompt = json.dumps({"input": str(text)[:2000], "context": context, "capabilities": capabilities}, ensure_ascii=False, default=str)
+        failures: list[str] = []
         online = self.ask_free(prompt, system=instructions, structured=True)
         if online.ok:
             return online
+        failures.append(online.error or "Groq unavailable")
         local = self._ask_local(prompt, instructions)
         if local.ok:
             return local
+        failures.append(local.error or "Ollama unavailable")
         gemini = self._ask_gemini(prompt, instructions)
         if gemini.ok:
             return gemini
-        return ProviderResult(False, "none", "", "", 0, "No hay proveedores de interpretación disponibles")
+        failures.append(gemini.error or "Gemini unavailable")
+        return ProviderResult(False, "none", "", "", 0, " | ".join(failures)[:700])

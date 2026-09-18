@@ -97,7 +97,7 @@ def get_base_dir():
 BASE_DIR        = get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 PROMPT_PATH     = BASE_DIR / "core" / "prompt.txt"
-LIVE_MODEL          = "models/gemini-3.1-flash-live-preview"
+LIVE_MODEL          = "gemini-3.8-live"
 CHANNELS            = 1
 SEND_SAMPLE_RATE    = 16000 
 RECEIVE_SAMPLE_RATE = 24000
@@ -409,6 +409,7 @@ class JarvisLive:
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
+        self._live_compat_level = 0  # 0 full, 1 no enhanced, 2 no transcripts, 3 no tools
 
         _base_dir = Path(__file__).resolve().parent
         _inline_names = {t["name"] for t in TOOL_DECLARATIONS}
@@ -1026,9 +1027,11 @@ class JarvisLive:
             _cfg = json.loads(open(API_CONFIG_PATH, encoding="utf-8").read())
             self._asst_name = (_cfg.get("assistant_name") or "JARVIS").strip()
             _user_name = (_cfg.get("user_name") or "").strip()
+            self._live_model = str(_cfg.get("live_model") or LIVE_MODEL).strip()
         except Exception:
             self._asst_name = "JARVIS"
             _user_name = ""
+            self._live_model = LIVE_MODEL
 
         memory     = load_memory()
         mem_str    = format_memory_for_prompt(memory)
@@ -1065,14 +1068,7 @@ class JarvisLive:
 
         cfg = dict(
             response_modalities=["AUDIO"],
-            output_audio_transcription={},
-            input_audio_transcription={},
             system_instruction="\n".join(parts),
-            tools=[{"function_declarations": (
-                TOOL_DECLARATIONS
-                + self._action_registry.get_tool_declarations()
-                + self._plugin_registry.get_tool_declarations()
-            )}],
             # Hand back the handle captured from the last session_resumption
             # update. `handle=None` is exactly the old behaviour (ask for
             # handles, start fresh), so the first connect of a run is unchanged.
@@ -1092,6 +1088,15 @@ class JarvisLive:
                 )
             ),
         )
+        if self._live_compat_level < 2:
+            cfg["output_audio_transcription"] = {}
+            cfg["input_audio_transcription"] = {}
+        if self._live_compat_level < 3:
+            cfg["tools"] = [{"function_declarations": (
+                TOOL_DECLARATIONS
+                + self._action_registry.get_tool_declarations()
+                + self._plugin_registry.get_tool_declarations()
+            )}]
         if self._enhanced_live:
             # Proactive audio: JARVIS stays silent when speech isn't addressed
             # to it (background chatter, talking to someone else in the room).
@@ -1278,7 +1283,7 @@ class JarvisLive:
             await self.session.send_realtime_input(
                 audio=types.Blob(
                     data=msg["data"],
-                    mime_type=msg.get("mime_type", "audio/pcm"),
+                    mime_type=msg.get("mime_type", "audio/pcm;rate=16000"),
                 )
             )
 
@@ -1331,7 +1336,7 @@ class JarvisLive:
                             try:
                                 loop.call_soon_threadsafe(
                                     self.out_queue.put_nowait,
-                                    {"data": _chunk_v63, "mime_type": "audio/pcm"}
+                                    {"data": _chunk_v63, "mime_type": "audio/pcm;rate=16000"}
                                 )
                             except Exception:
                                 pass
@@ -1346,7 +1351,7 @@ class JarvisLive:
             if not jarvis_speaking and not self.ui.muted and not self._phone_active:
                 loop.call_soon_threadsafe(
                     self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm"}
+                    {"data": data, "mime_type": "audio/pcm;rate=16000"}
                 )
                 # Feed the live mic level to the HUD so the waveform reacts to
                 # the user's actual voice while listening. Purely cosmetic — any
@@ -2113,7 +2118,7 @@ class JarvisLive:
                 )
 
                 async with (
-                    client.aio.live.connect(model=LIVE_MODEL, config=config) as session,
+                    client.aio.live.connect(model=getattr(self, "_live_model", LIVE_MODEL), config=config) as session,
                     asyncio.TaskGroup() as tg,
                 ):
                     self.session          = session
@@ -2213,6 +2218,25 @@ class JarvisLive:
                 err_str = str(e)
                 print(f"[JARVIS] Error ({type(e).__name__}): {e}")
                 traceback.print_exc()
+
+                # Gemini may accept the WebSocket and then reject a setup or
+                # realtime operation with 1008 policy violation. Do not loop
+                # over the same incompatible configuration: progressively
+                # remove optional capabilities and keep the voice session
+                # usable while logging exactly what was disabled.
+                _policy_violation = "1008" in err_str or "policy violation" in err_str.lower()
+                if _policy_violation and self._live_compat_level < 3:
+                    self._live_compat_level += 1
+                    self._resume_handle = None
+                    if self._live_compat_level == 1:
+                        self._enhanced_live = False
+                        self.ui.write_log("SYS: Live 1008 — reconnectando sin audio proactivo.")
+                    elif self._live_compat_level == 2:
+                        self.ui.write_log("SYS: Live 1008 — reconectando sin transcripciones opcionales.")
+                    else:
+                        self.ui.write_log("SYS: Live 1008 — reconectando sin tools para conservar voz.")
+                    self._conn_backoff = 3
+                    continue
 
                 # Proactive audio rejected by the server (preview API drift) —
                 # drop it and reconnect with the plain config.

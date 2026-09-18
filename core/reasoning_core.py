@@ -450,12 +450,12 @@ class ReasoningCore:
                         return DispatchResult("planned", preview, offline_plan["goal"], offline_plan)
                 self.context.update(
                     last_user_goal=text,
-                    last_tool_result={"state": "failed", "text": "semantic provider unavailable"},
+                    last_tool_result={"state": "failed", "text": str(exc)[:700]},
                 )
                 self.logger(f"semantic provider unavailable: {type(exc).__name__}")
                 return DispatchResult(
                     "failed",
-                    "El intérprete no está disponible temporalmente. Conservé el contexto y no ejecuté cambios.",
+                    f"El intérprete no está disponible. Conservé el contexto y no ejecuté cambios. Diagnóstico: {str(exc)[:420]}",
                     goal=text,
                 )
             if dry_run:
