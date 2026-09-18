@@ -1,0 +1,24 @@
+{
+  "mode": "free_first",
+  "monthly_budget_usd": 0.0,
+  "providers": {
+    "groq": {
+      "enabled": false,
+      "api_key": "",
+      "model": "openai/gpt-oss-20b",
+      "base_url": "https://api.groq.com/openai/v1/chat/completions",
+      "timeout_seconds": 10
+    },
+    "local": {
+      "enabled": true,
+      "base_url": "http://localhost:11434",
+      "model": "llama3.2:latest",
+      "timeout_seconds": 6
+    },
+    "gemini": {
+      "enabled": true,
+      "model": "gemini-2.5-flash",
+      "timeout_seconds": 20
+    }
+  }
+}

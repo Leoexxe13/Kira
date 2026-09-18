@@ -60,7 +60,7 @@ class ProviderManager:
                 "model": "llama3.2:latest",
                 "timeout_seconds": 6,
             },
-            "gemini": {"enabled": True, "model": "gemini-flash-latest"},
+            "gemini": {"enabled": True, "model": "gemini-2.5-flash", "timeout_seconds": 20},
         },
     }
     COOLDOWNS = {"groq": 30.0, "local": 10.0, "gemini": 30.0}
@@ -268,9 +268,10 @@ class ProviderManager:
         try:
             from google import genai
             from google.genai import types
-            model = self._config("gemini").get("model", "gemini-flash-latest")
+            model = self._config("gemini").get("model", "gemini-2.5-flash")
             started = time.perf_counter()
-            with genai.Client(api_key=key, http_options=types.HttpOptions(timeout=10000)) as client:
+            timeout_ms = int(float(self._config("gemini").get("timeout_seconds", 20)) * 1000)
+            with genai.Client(api_key=key, http_options=types.HttpOptions(timeout=timeout_ms)) as client:
                 response = client.models.generate_content(
                     model=model,
                     contents=prompt,
@@ -289,9 +290,10 @@ class ProviderManager:
             self._mark_success("gemini", latency)
             return ProviderResult(True, "gemini", model, text, latency)
         except Exception as exc:
-            error = f"Gemini {type(exc).__name__}"
+            detail = " ".join(str(exc).split())[:360]
+            error = f"Gemini {type(exc).__name__}: {detail}" if detail else f"Gemini {type(exc).__name__}"
             self._mark_failure("gemini", error)
-            return ProviderResult(False, "gemini", "", "", 0, error)
+            return ProviderResult(False, "gemini", model if "model" in locals() else "", "", 0, error)
 
     def interpret_request(self, text: str, context: dict, capabilities: list[dict], instructions: str = "") -> ProviderResult:
         """Try each configured interpreter at most once, without long retries."""
