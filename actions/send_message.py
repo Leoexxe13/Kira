@@ -1,3 +1,5 @@
+from core.capabilities import generic_target_owner, reserved_result
+
 import json
 import subprocess
 import sys
@@ -150,7 +152,8 @@ def _desktop_send(app_name: str, receiver: str, message: str) -> str:
     return f"Mensaje enviado a {receiver} via {app_name}."
 
 def _send_whatsapp(receiver: str, message: str) -> str:
-    return _desktop_send("WhatsApp", receiver, message)
+    # Includes legacy platform aliases already resolved by _PLATFORM_MAP.
+    return reserved_result("whatsapp_web")
 
 def _send_telegram(receiver: str, message: str) -> str:
     return _desktop_send("Telegram", receiver, message)
@@ -236,6 +239,9 @@ def send_message(
     player=None,
     session_memory=None,
 ) -> str:
+    owner = generic_target_owner("send_message", parameters or {})
+    if owner:
+        return reserved_result(owner)
     params       = parameters or {}
     receiver     = params.get("receiver", "").strip()
     message_text = params.get("message_text", "").strip()
@@ -269,7 +275,7 @@ def send_message(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "send_message",
-    "description": "Sends a text message via WhatsApp, Telegram, or other messaging platform.",
+    "description": "Sends a text message via generic messaging platforms. WhatsApp belongs exclusively to whatsapp_web(action=send).",
     "parameters": {
         "type": "OBJECT",
         "properties": {
@@ -283,7 +289,7 @@ TOOL = {
             },
             "platform": {
                 "type": "STRING",
-                "description": "Platform: WhatsApp, Telegram, etc."
+                "description": "Platform such as Telegram; use whatsapp_web for WhatsApp."
             }
         },
         "required": [
@@ -294,20 +300,3 @@ TOOL = {
     },
     "handler": send_message,
 }
-
-# === KIRA_WHATSAPP_EXCLUSIVE_ROUTE_V2 ===
-try:
-    _KIRA_ORIGINAL_TOOL_HANDLER_V2 = TOOL.get("handler")
-except Exception:
-    _KIRA_ORIGINAL_TOOL_HANDLER_V2 = None
-if callable(_KIRA_ORIGINAL_TOOL_HANDLER_V2):
-    def _kira_whatsapp_route_guard_v2(*args, **kwargs):
-        params = args[0] if args and isinstance(args[0], dict) else kwargs.get("parameters", {})
-        params = params if isinstance(params, dict) else {}
-        joined = " ".join(str(v) for v in params.values()).lower()
-        action = str(params.get("action", "")).lower()
-        if "web.whatsapp.com" in joined or ("whatsapp" in joined and action in {"open","abrir","new_tab","navigate","go","send","message"}):
-            return "KIRA_ROUTE_BLOCKED: WhatsApp está reservado para whatsapp_web. No se abrió Safari, Chrome ni una app alternativa."
-        return _KIRA_ORIGINAL_TOOL_HANDLER_V2(*args, **kwargs)
-    TOOL["handler"] = _kira_whatsapp_route_guard_v2
-# === END_KIRA_WHATSAPP_EXCLUSIVE_ROUTE_V2 ===

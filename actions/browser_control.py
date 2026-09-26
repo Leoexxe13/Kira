@@ -1,6 +1,8 @@
 
 from __future__ import annotations
 
+from core.capabilities import generic_target_owner, reserved_result
+
 import asyncio
 import concurrent.futures
 import os
@@ -929,6 +931,9 @@ def browser_control(
     player=None,
     session_memory=None,
 ) -> str:
+    owner = generic_target_owner("browser_control", parameters or {})
+    if owner:
+        return reserved_result(owner)
     params  = parameters or {}
     action  = params.get("action", "").lower().strip()
     browser = params.get("browser", "").lower().strip() or None
@@ -1063,7 +1068,7 @@ def _log(player, text: str):
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "browser_control",
-    "description": "Controls any web browser. Use for: opening websites, searching the web, clicking elements, filling forms, scrolling, screenshots, navigation, any web-based task. Simple open/search requests launch the user's own browser normally (their real profile and logged-in accounts); interactive actions (click, type, fill_form...) attach an automation browser. Always pass the 'browser' parameter when the user specifies a browser (e.g. 'open in Edge', 'use Firefox', 'open Chrome'). Multiple browsers can run simultaneously.",
+    "description": "Controls generic web browsers. WhatsApp is reserved exclusively for whatsapp_web, including simple access and internal operations. Use for: opening websites, searching the web, clicking elements, filling forms, scrolling, screenshots, navigation, any web-based task. Simple open/search requests launch the user's own browser normally (their real profile and logged-in accounts); interactive actions (click, type, fill_form...) attach an automation browser. Always pass the 'browser' parameter when the user specifies a browser (e.g. 'open in Edge', 'use Firefox', 'open Chrome'). Multiple browsers can run simultaneously.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
@@ -1130,20 +1135,3 @@ TOOL = {
     },
     "handler": browser_control,
 }
-
-# === KIRA_WHATSAPP_EXCLUSIVE_ROUTE_V2 ===
-try:
-    _KIRA_ORIGINAL_TOOL_HANDLER_V2 = TOOL.get("handler")
-except Exception:
-    _KIRA_ORIGINAL_TOOL_HANDLER_V2 = None
-if callable(_KIRA_ORIGINAL_TOOL_HANDLER_V2):
-    def _kira_whatsapp_route_guard_v2(*args, **kwargs):
-        params = args[0] if args and isinstance(args[0], dict) else kwargs.get("parameters", {})
-        params = params if isinstance(params, dict) else {}
-        joined = " ".join(str(v) for v in params.values()).lower()
-        action = str(params.get("action", "")).lower()
-        if "web.whatsapp.com" in joined or ("whatsapp" in joined and action in {"open","abrir","new_tab","navigate","go","send","message"}):
-            return "KIRA_ROUTE_BLOCKED: WhatsApp está reservado para whatsapp_web. No se abrió Safari, Chrome ni una app alternativa."
-        return _KIRA_ORIGINAL_TOOL_HANDLER_V2(*args, **kwargs)
-    TOOL["handler"] = _kira_whatsapp_route_guard_v2
-# === END_KIRA_WHATSAPP_EXCLUSIVE_ROUTE_V2 ===

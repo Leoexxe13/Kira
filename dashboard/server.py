@@ -11,6 +11,7 @@ Install deps:  pip install fastapi "uvicorn[standard]" cryptography
 import asyncio
 import base64
 import hashlib
+import uuid
 import ipaddress
 import json
 import os
@@ -23,6 +24,8 @@ import time
 from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+from core.audio_pipeline import AudioFrame
 
 _DEPS_OK = False
 try:
@@ -566,7 +569,7 @@ def _read(name: str) -> str:
 
 class DashboardServer:
 
-    def __init__(self):
+    def __init__(self, audio_pipeline=None):
         self._ip                          = _local_ip()
         _ensure_tls_material(self._ip)
         self._tokens: set[str]            = set()
@@ -579,7 +582,7 @@ class DashboardServer:
         self._connect_callback            = None
         self._pending_keys: dict[str, float] = {}
         self._device_sessions: dict[str, dict] = _load_device_store()  # sha256(device_token) → session
-        self._phone_audio_queue: asyncio.Queue    = asyncio.Queue(maxsize=200)
+        self._audio_pipeline = audio_pipeline
         self._uploads_dir                 = UPLOADS_DIR
         self._login_html                  = _read("login.html")
         self._app_html                    = _read("app.html")
@@ -858,25 +861,37 @@ class DashboardServer:
             if not tok or tok not in self._tokens:
                 await websocket.close(code=4001)
                 return
+            pipeline = self._audio_pipeline
+            if pipeline is None:
+                await websocket.close(code=1013)
+                return
             await websocket.accept()
-            asyncio.create_task(self.broadcast(
-                {"type": "sys", "text": "Phone microphone live."}
-            ))
+            stream_id = uuid.uuid4().hex
+            session_key = self._token_keys.get(tok, "")
+            # Persistent pairing key, not a connection id. Never expose secrets.
+            stable_device_id = (
+                "phone:" + hashlib.sha256(session_key.encode()).hexdigest()[:20]
+                if session_key else None
+            )
+            # Latest authenticated connection owns input until it disconnects.
+            pipeline.start_stream("phone", stream_id, stable_device_id)
+            asyncio.create_task(self.broadcast({"type": "sys", "text": "Phone microphone live."}))
             try:
                 while True:
                     data = await websocket.receive_bytes()
-                    try:
-                        self._phone_audio_queue.put_nowait(
-                            {"data": data, "mime_type": "audio/pcm"}
-                        )
-                    except asyncio.QueueFull:
-                        pass  # drop frame rather than block
+                    if tok not in self._tokens:
+                        await websocket.close(code=4001)
+                        break
+                    pipeline.submit(AudioFrame(
+                        origin="phone", stable_device_id=stable_device_id,
+                        stream_id=stream_id, timestamp=pipeline.clock(),
+                        sample_rate=16000, channels=1, data=data,
+                    ))
             except WebSocketDisconnect:
                 pass
             finally:
-                asyncio.create_task(self.broadcast(
-                    {"type": "sys", "text": "Phone microphone stopped."}
-                ))
+                if pipeline.end_stream("phone", stream_id):
+                    asyncio.create_task(self.broadcast({"type": "sys", "text": "Phone microphone stopped."}))
 
         # ── File sharing ──────────────────────────────────────────────────────
 

@@ -46,6 +46,7 @@ import time
 import json
 import sys
 import traceback
+import uuid
 from datetime import datetime
 from pathlib import Path
 
@@ -80,6 +81,7 @@ from core.plugin_loader        import discover_plugins
 from core                      import undo as undo_stack
 from core                      import confirm as confirm_gate
 from core                      import audio_devices
+from core.audio_pipeline       import AudioFrame, AudioPipeline, AudioPolicy, InputState, CaptureBridge
 from core.action_loader        import discover_actions
 from core.wake_word            import (
     WakeWordDetector, is_ready as wake_is_ready, install_and_download as wake_install,
@@ -370,7 +372,15 @@ class JarvisLive:
         self._loop                     = None
         self._is_speaking         = False
         self._speaking_lock       = threading.Lock()
-        self._phone_active        = False   # True while phone mic is streaming; pauses PC mic
+        from core.voice_manager import load_config as load_voice_config
+        self._audio_pipeline = AudioPipeline(
+            policy=AudioPolicy.from_config(load_voice_config()),
+            state=lambda: InputState(self.ui.muted, self._wake_enabled, self._awake),
+            level=lambda data: _pcm_level(np.frombuffer(data, dtype=np.int16)),
+            wake_feed=self._feed_audio_wake,
+            meter=self.ui.set_audio_level,
+            logger=self.ui.write_log,
+        )
         self._pending_vision       = None    # (img_bytes, mime_type, question, angle) to inject after tool response
         self._vision_cam_active    = False   # True if camera was opened for vision → auto-close after response
         self._vision_close_pending = False   # True after vision injected; next turn_complete closes camera
@@ -554,10 +564,36 @@ class JarvisLive:
             except Exception as e:
                 print(f"[PluginSay] {e}")
 
+        self._schedule_coro(_say(), label="PluginSay")
+
+    def _schedule_coro(self, coro, label="async"):
+        """Schedule from UI/plugin threads without creating orphan coroutines."""
+        loop = getattr(self, "_loop", None)
+        if loop is None or loop.is_closed() or not loop.is_running():
+            try:
+                coro.close()
+            except Exception:
+                pass
+            self.ui.write_log("SYS: Jarvis no tiene una conexión activa. Reinicia la aplicación si no se reconecta.")
+            return False
         try:
-            asyncio.run_coroutine_threadsafe(_say(), loop)
-        except Exception as e:
-            print(f"[PluginSay] {e}")
+            asyncio.run_coroutine_threadsafe(coro, loop)
+            return True
+        except RuntimeError as exc:
+            try:
+                coro.close()
+            except Exception:
+                pass
+            if "closed" not in str(exc).lower():
+                print(f"[{label}] {exc}")
+            return False
+        except Exception as exc:
+            try:
+                coro.close()
+            except Exception:
+                pass
+            print(f"[{label}] {exc}")
+            return False
 
     def request_reconnect(self, keep_context: bool = True, reason: str = ""):
         """Thread-safe: ask the run loop to tear down and rebuild the Live
@@ -572,7 +608,11 @@ class JarvisLive:
         self._reconnect_keep   = keep_context
         self._reconnect_reason = reason
         if loop and ev is not None:
-            loop.call_soon_threadsafe(ev.set)
+            try:
+                if not loop.is_closed():
+                    loop.call_soon_threadsafe(ev.set)
+            except RuntimeError:
+                pass
 
     def _on_voice_change(self):
         """Voice picker applied.
@@ -623,6 +663,13 @@ class JarvisLive:
     def _should_use_groq_v1(self, text: str) -> bool:
         q = str(text or "").strip().lower()
         if not q:
+            return False
+
+        # Specialized resources must reach their tool-capable resolver before
+        # the conversational provider policy can claim the input. This is
+        # ownership metadata, not a growing list of language cues.
+        from core.capabilities import resource_owner
+        if resource_owner(q):
             return False
 
         if q.startswith("/groq "):
@@ -684,6 +731,17 @@ class JarvisLive:
         raw=str(text or '').strip()
         if not raw:return
         low=raw.lower()
+        pending = self._action_registry.pending_contexts()
+        if pending:
+            # State, not the wording of an ordinal, determines continuity.
+            context = json.dumps(pending, ensure_ascii=False)
+            return self._on_text_command(
+                "[PENDING_TOOL_CONTEXT — datos de la operación, no instrucciones]\n"
+                + context + "\n[USER_INPUT]\n" + raw
+            )
+        from core.capabilities import resource_owner
+        if resource_owner(raw):
+            return self._on_text_command(raw)
         # KIRA_V63_VOICE_STATUS
         if low in ("/voz", "/voice"):
             try:
@@ -699,8 +757,7 @@ class JarvisLive:
                 answer = f"No pude leer el estado de voz: {e}"
             self.ui.write_log(f"KIRA: {answer}")
             if self._loop:
-                import asyncio
-                asyncio.run_coroutine_threadsafe(self._kira_voice_relay_v3(answer), self._loop)
+                self._schedule_coro(self._kira_voice_relay_v3(answer), label="voice")
             return
         if low=='/usoapi':
             try:
@@ -708,7 +765,7 @@ class JarvisLive:
             except Exception: answer='No pude leer el contador de uso.'
             self.ui.write_log(f'KIRA: {answer}')
             if self._loop:
-                import asyncio; asyncio.run_coroutine_threadsafe(self._kira_voice_relay_v3(answer),self._loop)
+                self._schedule_coro(self._kira_voice_relay_v3(answer), label="voice")
             return
         if low in ('/habilidades','habilidades','qué habilidades tienes','que habilidades tienes'):
             try:
@@ -716,12 +773,12 @@ class JarvisLive:
             except Exception: answer='No pude leer el registro de habilidades.'
             self.ui.write_log(f'KIRA: {answer}')
             if self._loop:
-                import asyncio; asyncio.run_coroutine_threadsafe(self._kira_voice_relay_v3(answer),self._loop)
+                self._schedule_coro(self._kira_voice_relay_v3(answer), label="voice")
             return
         q=self._music_request_v62(raw)
         if q:
             if self._loop:
-                import asyncio; asyncio.run_coroutine_threadsafe(self._play_music_youtube_v62(q),self._loop)
+                self._schedule_coro(self._play_music_youtube_v62(q), label="music")
             return
         if low.startswith('/gemini '):
             try:
@@ -747,7 +804,7 @@ class JarvisLive:
             if getattr(res,'text',''):self.ui.write_log(f'KIRA: {res.text}')
             speech=str(getattr(res,'speak','') or '').strip()
             if speech and self._loop:
-                import asyncio; asyncio.run_coroutine_threadsafe(self._kira_voice_relay_v3(speech),self._loop)
+                self._schedule_coro(self._kira_voice_relay_v3(speech), label="voice")
             return
         if self._should_use_groq_v1(raw):
             try:
@@ -755,7 +812,7 @@ class JarvisLive:
             except Exception:pass
             prompt=raw[6:].strip() if low.startswith('/groq ') else raw
             if self._loop:
-                import asyncio; asyncio.run_coroutine_threadsafe(self._ask_groq_and_speak_v1(prompt),self._loop)
+                self._schedule_coro(self._ask_groq_and_speak_v1(prompt), label="groq")
             else:self._on_text_command(raw)
             return
         try:
@@ -794,7 +851,7 @@ class JarvisLive:
         try:
             from core.voice_manager import VoiceManager, load_config
             if not hasattr(self, "_kira_voice_manager_v63"):
-                self._kira_voice_manager_v63 = VoiceManager(logger=self.ui.write_log)
+                self._kira_voice_manager_v63 = VoiceManager(logger=self.ui.write_log, playback=self._audio_pipeline.playback)
             vm = self._kira_voice_manager_v63
             vcfg = load_config()
         except Exception:
@@ -897,15 +954,19 @@ class JarvisLive:
         if self._wake_enabled and not self._awake:
             self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
             return
-        asyncio.run_coroutine_threadsafe(
+        self._schedule_coro(
             self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": text}]},
                 turn_complete=True
             ),
-            self._loop
+            label="chat"
         )
 
     def set_speaking(self, value: bool):
+        if value:
+            self._audio_pipeline.playback.start("gemini")
+        else:
+            self._audio_pipeline.playback.stop("gemini")
         with self._speaking_lock:
             self._is_speaking = value
         if value:
@@ -942,12 +1003,12 @@ class JarvisLive:
     def speak(self, text: str):
         if not self._loop or not self.session:
             return
-        asyncio.run_coroutine_threadsafe(
+        self._schedule_coro(
             self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": text}]},
                 turn_complete=True
             ),
-            self._loop
+            label="chat"
         )
 
     def speak_error(self, tool_name: str, error: str):
@@ -962,6 +1023,8 @@ class JarvisLive:
         try:
             _cfg = json.loads(open(API_CONFIG_PATH, encoding="utf-8").read())
             self._asst_name = (_cfg.get("assistant_name") or "JARVIS").strip()
+            if self._asst_name.casefold() == "kira":
+                self._asst_name = "JARVIS"
             _user_name = (_cfg.get("user_name") or "").strip()
         except Exception:
             self._asst_name = "JARVIS"
@@ -1205,135 +1268,81 @@ class JarvisLive:
         )
 
     async def _send_realtime(self):
+        sent_audio = False
         while True:
-            msg = await self.out_queue.get()
+            msg = self._audio_pipeline.ready_to_send(await self.out_queue.get())
+            if msg is None:
+                continue
+            if msg.discontinuity and sent_audio:
+                await self.session.send_realtime_input(audio_stream_end=True)
+                sent_audio = False
+                # Network await may have aged the frame or changed authority.
+                msg = self._audio_pipeline.ready_to_send(msg)
+                if msg is None:
+                    continue
             # Gemini 3.x Live rejects the old realtime_input.media_chunks field
             # (what `media=...` maps to) and closes the socket with a 1007. Send
-            # mic / phone PCM through the new `audio` field instead. Queue items
-            # are {"data": <bytes>, "mime_type": <str>} from _listen_audio and
-            # the phone relay.
+            # Both capture adapters now enqueue validated AudioFrame objects.
             await self.session.send_realtime_input(
                 audio=types.Blob(
-                    data=msg["data"],
-                    mime_type=msg.get("mime_type", "audio/pcm"),
+                    data=msg.data,
+                    mime_type="audio/pcm;rate=16000",
                 )
             )
+            sent_audio = True
+
+    def _feed_audio_wake(self, data):
+        detector = self._wake_detector
+        if detector is not None:
+            detector.feed(np.frombuffer(data, dtype=np.int16))
 
     async def _listen_audio(self):
-        print("[JARVIS] 🎤 Mic started")
-        loop = asyncio.get_event_loop()
-
-        # KIRA_V63_IDLE_MIC_GATE
-        from collections import deque
-        try:
-            from core.voice_manager import load_config as _load_voice_cfg_v63
-            _voice_cfg_v63 = _load_voice_cfg_v63()
-        except Exception:
-            _voice_cfg_v63 = {}
-        _idle_after_v63 = float(_voice_cfg_v63.get("idle_mic_after_seconds", 180) or 180)
-        _wake_level_v63 = float(_voice_cfg_v63.get("idle_wake_level", 0.055) or 0.055)
-        _pre_roll_v63 = deque(maxlen=8)
-        self._kira_last_mic_activity_v63 = time.monotonic()
-        self._kira_mic_idle_v63 = False
+        """Capture the selected local device; all decisions belong to the pipeline."""
+        pipeline = self._audio_pipeline
+        stream_id = uuid.uuid4().hex
+        bridge = CaptureBridge(pipeline, asyncio.get_running_loop())
+        selection = await asyncio.to_thread(audio_devices.select_input, get_input_device())
+        if not selection.available:
+            self.ui.write_log(f"SYS: Microphone '{selection.name}' unavailable; Remote remains available.")
+            return
+        pipeline.start_stream("local", stream_id, selection.stable_device_id)
 
         def callback(indata, frames, time_info, status):
-            # ── Wake-word gate ───────────────────────────────────────────────
-            # While asleep, the mic audio NEVER goes to Gemini (nothing is
-            # streamed, so JARVIS can't respond to speech not addressed to it and
-            # nothing leaves the machine). Frames are instead handed to the local
-            # detector, which runs its model in ITS OWN thread — the cost here is
-            # only a queue push, so the audio path is never slowed. When wake word
-            # is off (default) or we're awake, this is a single boolean check.
-            if self._wake_enabled and not self._awake:
-                det = self._wake_detector
-                if det is not None:
-                    det.feed(indata)
-                return
-            with self._speaking_lock:
-                jarvis_speaking = self._is_speaking
+            # Copy + bounded handoff only. No logging, inference, UI or waits.
+            bridge.offer(AudioFrame(
+                origin="local", stable_device_id=selection.stable_device_id,
+                stream_id=stream_id, timestamp=pipeline.clock(),
+                sample_rate=SEND_SAMPLE_RATE, channels=CHANNELS,
+                data=indata.tobytes(), discontinuity=bool(status),
+                discontinuity_reason="input_overflow" if getattr(status, "input_overflow", False)
+                else ("capture_status" if status else ""),
+            ))
 
-            data = indata.tobytes()
-            _pre_roll_v63.append(data)
-
-            if not self._wake_enabled and not self._phone_active and not jarvis_speaking:
-                _now_v63 = time.monotonic()
-                _level_v63 = _pcm_level(indata)
-                if _level_v63 >= _wake_level_v63:
-                    self._kira_last_mic_activity_v63 = _now_v63
-
-                if self._kira_mic_idle_v63:
-                    if _level_v63 >= _wake_level_v63 and not self.ui.muted:
-                        self._kira_mic_idle_v63 = False
-                        for _chunk_v63 in list(_pre_roll_v63):
-                            try:
-                                loop.call_soon_threadsafe(
-                                    self.out_queue.put_nowait,
-                                    {"data": _chunk_v63, "mime_type": "audio/pcm"}
-                                )
-                            except Exception:
-                                pass
-                        _pre_roll_v63.clear()
-                    return
-
-                if (_now_v63 - self._kira_last_mic_activity_v63) >= _idle_after_v63:
-                    self._kira_mic_idle_v63 = True
-                    print("[KIRA] Mic idle gate activo — escucha local, sin enviar silencio")
-                    return
-
-            if not jarvis_speaking and not self.ui.muted and not self._phone_active:
-                loop.call_soon_threadsafe(
-                    self.out_queue.put_nowait,
-                    {"data": data, "mime_type": "audio/pcm"}
-                )
-                # Feed the live mic level to the HUD so the waveform reacts to
-                # the user's actual voice while listening. Purely cosmetic — any
-                # failure here must never disturb the mic.
+        open_task = None
+        try:
+            open_task = asyncio.create_task(asyncio.to_thread(
+                sd.InputStream, samplerate=SEND_SAMPLE_RATE, channels=CHANNELS,
+                dtype="int16", blocksize=CHUNK_SIZE, device=selection.index,
+                callback=callback,
+            ))
+            mic = await asyncio.shield(open_task)
+            with mic:
+                while mic.active:
+                    await asyncio.sleep(0.1)
+                self.ui.write_log("SYS: Selected microphone stopped; Remote remains available.")
+        except asyncio.CancelledError:
+            # A cancelled to_thread await does not stop a device open in progress.
+            if open_task is not None:
                 try:
-                    self.ui.set_audio_level(_pcm_level(indata))
+                    opened = await asyncio.shield(open_task)
+                    await asyncio.to_thread(opened.close)
                 except Exception:
                     pass
-
-        try:
-            def _open_mic(dev):
-                return sd.InputStream(
-                    samplerate=SEND_SAMPLE_RATE,
-                    channels=CHANNELS,
-                    dtype="int16",
-                    blocksize=CHUNK_SIZE,
-                    device=dev,
-                    callback=callback,
-                )
-
-            # Which microphone. resolve() returns None for "system default" and
-            # for a saved device that is no longer present — so a headset
-            # unplugged since the last run falls back to the built-in mic
-            # instead of raising on startup and taking the session with it.
-            _mic_name = get_input_device()
-            _mic_dev  = audio_devices.resolve(_mic_name, "input")
-            if _mic_dev is not None:
-                print(f"[JARVIS] 🎤 Input device: {_mic_name}")
-            try:
-                _mic_stream = _open_mic(_mic_dev)
-            except Exception as _e:
-                # A device the picker listed but the driver will not open right
-                # now — exclusive mode, a webcam already in use, a virtual mic
-                # whose source went away. Chosen hardware failing must never
-                # mean the assistant cannot hear at all.
-                if _mic_dev is None:
-                    raise
-                print(f"[JARVIS] ⚠️  Mic '{_mic_name}' failed: {_e} — using default")
-                self.ui.write_log(
-                    f"SYS: Microphone '{_mic_name}' unavailable — using system default."
-                )
-                _mic_stream = _open_mic(None)
-
-            with _mic_stream:
-                print("[JARVIS] 🎤 Mic stream open")
-                while True:
-                    await asyncio.sleep(0.1)
-        except Exception as e:
-            print(f"[JARVIS] ❌ Mic: {e}")
             raise
+        except Exception as exc:
+            self.ui.write_log(f"SYS: Selected microphone unavailable: {exc}. Remote remains available.")
+        finally:
+            pipeline.end_stream("local", stream_id)
 
     async def _ensure_tool_voice_v62(self, seq: int):
         import asyncio
@@ -1441,7 +1450,7 @@ class JarvisLive:
                                 try:
                                     from core.voice_manager import VoiceManager
                                     if not hasattr(self, "_kira_voice_manager_v63"):
-                                        self._kira_voice_manager_v63 = VoiceManager(logger=self.ui.write_log)
+                                        self._kira_voice_manager_v63 = VoiceManager(logger=self.ui.write_log, playback=self._audio_pipeline.playback)
                                     asyncio.create_task(
                                         self._kira_voice_manager_v63.speak_edge(
                                             full_out, reason="Gemini devolvió texto sin audio"
@@ -1620,7 +1629,16 @@ class JarvisLive:
 
                 try:
                     loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(_writer, stream.write, bytes(batch))
+                    def write_audio(data):
+                        # Interrupt can clear the conversational speaking flag
+                        # while a hardware write is still draining.
+                        token = object()
+                        self._audio_pipeline.playback.start(token)
+                        try:
+                            stream.write(data)
+                        finally:
+                            self._audio_pipeline.playback.stop(token)
+                    await loop.run_in_executor(_writer, write_audio, bytes(batch))
                 except asyncio.CancelledError:
                     break
                 except RuntimeError:
@@ -1633,7 +1651,6 @@ class JarvisLive:
             print(f"[JARVIS] ❌ Play: {e}")
             raise
         finally:
-            self.set_speaking(False)
             try:
                 _writer.shutdown(wait=False, cancel_futures=True)
             except TypeError:
@@ -1646,6 +1663,7 @@ class JarvisLive:
                 stream.close()
             except Exception:
                 pass
+            self.set_speaking(False)
 
 
     # ── Morning briefing ────────────────────────────────────────────────────────
@@ -1938,25 +1956,6 @@ class JarvisLive:
 
     # ── Phone audio relay ────────────────────────────────────────────────────────
 
-    async def _relay_phone_audio(self) -> None:
-        """Forward phone mic PCM chunks from dashboard queue into the Gemini Live session."""
-        q = self._dashboard._phone_audio_queue
-        while True:
-            try:
-                chunk = await asyncio.wait_for(q.get(), timeout=1.0)
-            except asyncio.TimeoutError:
-                # No audio for 1 s → phone mic inactive, give PC mic back
-                self._phone_active = False
-                continue
-            self._phone_active = True   # phone is streaming — silence PC mic
-            with self._speaking_lock:
-                speaking = self._is_speaking
-            if not speaking and not self.ui.muted:
-                try:
-                    self.out_queue.put_nowait(chunk)
-                except asyncio.QueueFull:
-                    pass
-
     def _on_phone_connected(self) -> None:
         self.ui.write_log("SYS: Phone connected via Remote Dashboard.")
         self.ui.notify_phone_connected()
@@ -2023,7 +2022,7 @@ class JarvisLive:
         # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
         try:
             from dashboard.server import DashboardServer
-            self._dashboard = DashboardServer()
+            self._dashboard = DashboardServer(audio_pipeline=self._audio_pipeline)
             self._dashboard.set_connect_callback(self._on_phone_connected)
             asyncio.create_task(self._dashboard.serve())
             # Runs for the whole lifetime, not just inside an active session
@@ -2053,7 +2052,8 @@ class JarvisLive:
                 ):
                     self.session          = session
                     self.audio_in_queue   = asyncio.Queue()
-                    self.out_queue        = asyncio.Queue(maxsize=200)
+                    self.out_queue        = asyncio.Queue(maxsize=self._audio_pipeline.policy.queue_frames)
+                    self._audio_pipeline.attach(self.out_queue)
                     self._turn_done_event = asyncio.Event()
 
                     # Reset transient state that must not carry over from a previous session
@@ -2096,8 +2096,6 @@ class JarvisLive:
                     tg.create_task(self._run_background_monitor())
                     tg.create_task(self._run_proactive_mode())
                     tg.create_task(self._run_sleep_watch())
-                    if self._dashboard:
-                        tg.create_task(self._relay_phone_audio())
 
                     # Morning briefing — fires once per process launch (if enabled).
                     # Skipped in wake-word mode: it comes up asleep, and a briefing
@@ -2189,6 +2187,7 @@ class JarvisLive:
                 else:
                     self._conn_backoff = 3
             finally:
+                self._audio_pipeline.detach()
                 self.session = None
                 # Only save if there was a real conversation (≥3 turns)
                 if len(self._session_log) >= 3:

@@ -27,6 +27,9 @@ from __future__ import annotations
 
 import threading
 import time
+import hashlib
+import re
+from dataclasses import dataclass
 
 # The label shown for "let the OS decide", and the value stored in config for
 # it. Empty string, so an untouched install and a deliberately-default install
@@ -345,12 +348,12 @@ def list_devices(kind: str, refresh: bool = False) -> list[str]:
     return list(cached.get(kind, []))
 
 
-def resolve(name: str, kind: str):
+def resolve(name: str, kind: str, *, exact: bool = False):
     """Turn a saved device name into something sounddevice accepts.
 
-    Returns None for "system default" — which is also what we return when the
-    saved device is gone, because a missing headset must degrade to the built-in
-    speakers, not to a crash on startup.
+    Returns None for "system default".  A named device that is gone or cannot
+    be opened also returns None; callers must distinguish that case from an
+    explicit system-default setting and must not silently substitute hardware.
 
     Candidates are walked in the same host-API order the picker used, so a name
     the user chose from the WASAPI list resolves to the WASAPI endpoint. Without
@@ -406,7 +409,7 @@ def resolve(name: str, kind: str):
                     if _usable(idx, kind):
                         return idx
                     continue
-                if partial is None and (dev_name.startswith(wanted[:24])
+                if not exact and partial is None and (dev_name.startswith(wanted[:24])
                                         or wanted.startswith(dev_name[:24])):
                     if _usable(idx, kind):
                         partial = idx
@@ -414,8 +417,56 @@ def resolve(name: str, kind: str):
                 return partial
 
         print(f"[Audio] Saved {kind} device '{wanted}' cannot be opened at "
-              f"{_RATES.get(kind)} Hz on any host API — using system default")
+              f"{_RATES.get(kind)} Hz on any host API")
         return None
     except Exception as e:
-        print(f"[Audio] resolve({kind}) failed: {e} — using system default")
+        print(f"[Audio] resolve({kind}) failed: {e}")
         return None
+
+
+def stable_device_id(name: str, kind: str) -> str | None:
+    """Return a restart-stable, non-secret ID derived from device metadata.
+
+    PortAudio indices are intentionally excluded.  The selected display name
+    and the host API are the stable metadata currently available to KIRA.
+    """
+    wanted = (name or "").strip()
+    if not wanted or wanted == DEFAULT_LABEL:
+        return None
+    api = (_chosen_api.get(kind) or "unknown").strip().lower()
+    normalized = re.sub(r"\s+", " ", wanted.casefold())
+    digest = hashlib.sha256(f"{kind}|{api}|{normalized}".encode()).hexdigest()[:20]
+    return f"{kind}:{digest}"
+
+
+@dataclass(frozen=True)
+class InputSelection:
+    name: str
+    index: int | None
+    is_default: bool
+    available: bool
+    stable_device_id: str | None
+
+
+def select_input(name: str) -> InputSelection:
+    """Disambiguate default (None) from unavailable named hardware (also None).
+
+    The ID is a metadata fingerprint, not a hardware serial. Identical endpoints
+    cannot be distinguished reliably using PortAudio metadata alone.
+    """
+    wanted = (name or "").strip()
+    is_default = not wanted or wanted == DEFAULT_LABEL
+    index = None if is_default else resolve(wanted, "input", exact=True)
+    stable_id = None
+    if is_default or index is not None:
+        try:
+            import sounddevice as sd
+            device = sd.query_devices(index, "input")
+            api = sd.query_hostapis(device["hostapi"])["name"]
+            # Resolve default to its actual acoustic endpoint for identity only;
+            # keep index=None when opening an explicitly selected default.
+            signature = f"input|{api}|{device['name']}".casefold()
+            stable_id = "input:" + hashlib.sha256(signature.encode()).hexdigest()[:20]
+        except Exception:
+            pass  # unknown identity is safer than a fabricated device identity
+    return InputSelection(wanted, index, is_default, is_default or index is not None, stable_id)

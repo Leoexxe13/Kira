@@ -15,6 +15,9 @@ from difflib import SequenceMatcher
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright
+from memory.memory_manager import (
+    get_whatsapp_contact, remember_whatsapp_contact, forget_whatsapp_contact,
+)
 
 _URL = "https://web.whatsapp.com/"
 _PROFILE = Path.home() / ".kira_whatsapp_profile"
@@ -110,7 +113,6 @@ class _WhatsAppWorker:
     def __init__(self):
         self._q = queue.Queue()
         self._thread = threading.Thread(target=self._run, name="KIRA-WhatsApp-WAJS", daemon=True)
-        self._thread.start()
         self._pw = None
         self._ctx = None
         self._page = None
@@ -120,6 +122,77 @@ class _WhatsAppWorker:
         self._last_candidates = []
         self._last_candidate_query = ""
         self._last_candidates_at = 0.0
+        self._account = ""
+        self._candidate_account = ""
+        self._request_params = {}
+        self._memory_warning = ""
+        self._pending_lock = threading.Lock()
+        self._pending_snapshot = None
+        self._thread.start()
+
+    def pending_context(self):
+        """Thread-safe snapshot; never touch Playwright from the text/UI thread."""
+        with self._pending_lock:
+            snapshot = self._pending_snapshot
+            if not snapshot or time.monotonic() - snapshot[0] > 300:
+                return None
+            return json.loads(json.dumps(snapshot[1]))
+
+    def _account_id(self, page):
+        try:
+            account = str(page.evaluate("""async () => {
+                if (!(await WPP.conn.isAuthenticated())) return "";
+                const id = await WPP.conn.getMyUserId();
+                return id ? String(id._serialized || id) : "";
+            }""") or "")
+            user, _, server = account.partition("@")
+            if (user and not any(c.isspace() or c == ":" for c in user)
+                    and server in {"c.us", "s.whatsapp.net", "lid"}):
+                return account
+            return ""
+        except Exception:
+            return ""
+
+    def _sync_account(self, page):
+        account = self._account_id(page)
+        if account != self._account:
+            self._clear_candidates()
+            self._last_send = ("", "", 0.0)
+            self._active_chat_id = self._active_chat_name = ""
+        self._account = account
+
+    def _identity_by_id(self, page, chat_id):
+        """Exact WA-JS lookup, independent of the bounded recent-chat ranking."""
+        return page.evaluate("""async (id) => {
+            const c = (await WPP.chat.get(id)) || (await WPP.contact.get(id));
+            if (!c) return null;
+            const actual = String(c.id?._serialized || c.id || "");
+            if (actual !== id) return null;
+            return {id: actual, name: String(c.name || c.formattedTitle || c.pushname || actual)};
+        }""", chat_id)
+
+    def _resolve_target(self, page, wanted):
+        """Confirmed memory precedes the unchanged name resolver, never replaces it."""
+        if not self._account:
+            return None, [], {"ok": False, "reason": "No pude identificar la cuenta autenticada; resolución bloqueada sin reutilizar otra cuenta."}
+        try:
+            remembered = get_whatsapp_contact(self._account, _norm(wanted))
+            if remembered:
+                identity = self._identity_by_id(page, remembered["id"])
+                if not identity or identity.get("id") != remembered["id"]:
+                    return None, [], {
+                        "ok": False, "query": wanted, "forget_required": True,
+                        "reason": "No pude validar la identidad recordada. No elegí otro contacto. Puedes reintentar cuando esté disponible u olvidar la asociación para resolver de nuevo.",
+                    }
+                identity["resolution_source"] = "memory"
+                return identity, [], None
+        except Exception:
+            return None, [], {
+                "ok": False, "query": wanted,
+                "reason": "No pude comprobar la memoria o la identidad de WhatsApp; operación bloqueada sin buscar un sustituto.",
+            }
+        best, candidates = self._resolve_chat(page, wanted)
+        return best, candidates, None
 
     def call(self, params, timeout=90):
         done = queue.Queue(maxsize=1)
@@ -420,12 +493,22 @@ class _WhatsAppWorker:
         self._last_candidates = clean
         self._last_candidate_query = str(query or "").strip()
         self._last_candidates_at = time.monotonic()
+        self._candidate_account = self._account
+        with self._pending_lock:
+            self._pending_snapshot = (self._last_candidates_at, {
+                "query": self._last_candidate_query,
+                "candidates": clean,
+                "operation": dict(self._request_params),
+            }) if clean else None
         return clean
 
     def _clear_candidates(self):
         self._last_candidates = []
         self._last_candidate_query = ""
         self._last_candidates_at = 0.0
+        self._candidate_account = ""
+        with self._pending_lock:
+            self._pending_snapshot = None
 
     def _candidate_choice(self, candidate_id="", candidate_index=0):
         """Selecciona solo desde la última lista ambigua, nunca por adivinanza."""
@@ -461,8 +544,13 @@ class _WhatsAppWorker:
     def _resolve_and_open(self, page, wanted="", candidate_id="", candidate_index=0):
         """Resuelve por nombre o por opción exacta de la última lista ambigua."""
         using_choice = bool(str(candidate_id or "").strip() or int(candidate_index or 0))
+        original_query = self._last_candidate_query if using_choice else wanted
+        account = self._account
 
         if using_choice:
+            if not account or self._candidate_account != account:
+                self._clear_candidates()
+                return None, [], {"ok": False, "reason": "La cuenta de la selección no pudo verificarse; busca nuevamente."}
             best, err = self._candidate_choice(candidate_id, candidate_index)
             candidates = list(self._last_candidates or [])
             if not best:
@@ -474,7 +562,10 @@ class _WhatsAppWorker:
                     "selection_supported": True,
                 }
         else:
-            best, candidates = self._resolve_chat(page, wanted)
+            best, candidates, error = self._resolve_target(page, wanted)
+            if error:
+                self._clear_candidates()
+                return None, [], error
             if not best:
                 numbered = self._remember_candidates(wanted, candidates)
                 return None, numbered, {
@@ -512,11 +603,21 @@ class _WhatsAppWorker:
         if "match_score" not in selected and selected.get("score") is not None:
             selected["match_score"] = selected.get("score")
 
+        if account and self._account_id(page) != account:
+            self._clear_candidates()
+            return None, [], {"ok": False, "reason": "La cuenta cambió durante la verificación; operación bloqueada."}
+        if using_choice:
+            try:
+                remember_whatsapp_contact(account, _norm(original_query), best["id"],
+                                          best.get("name") or best["id"])
+            except Exception:
+                self._memory_warning = "El destinatario fue verificado, pero no pude guardar la asociación."
+
         self._clear_candidates()
         return selected, candidates, {
             "ok": True,
             "active": active,
-            "selected_by": "candidate" if using_choice else "name",
+            "selected_by": "candidate" if using_choice else best.get("resolution_source", "name"),
         }
 
     def _active_chat(self, page):
@@ -832,6 +933,20 @@ class _WhatsAppWorker:
         return result or {"ok": False, "error": "sendTextMessage no devolvió resultado."}
 
     def _dispatch(self, p):
+        self._request_params = dict(p)
+        self._memory_warning = ""
+        result = self._dispatch_action(p)
+        if self._memory_warning:
+            prefix, _, body = result.partition(": ")
+            try:
+                payload = json.loads(body)
+                payload["memory_warning"] = self._memory_warning
+                return _dump(prefix, payload)
+            except (ValueError, TypeError):
+                return result + " " + self._memory_warning
+        return result
+
+    def _dispatch_action(self, p):
         action = _norm(p.get("action", "open")).replace(" ", "_")
         chat = str(p.get("chat", "") or "").strip()
         message = str(p.get("message", "") or "").strip()
@@ -869,6 +984,8 @@ class _WhatsAppWorker:
             action = "close"
 
         if action == "close":
+            self._clear_candidates()
+            self._account = ""
             # Close ONLY the dedicated WhatsApp Playwright window/context.
             # Never call the generic application/window closer here.
             try:
@@ -891,19 +1008,32 @@ class _WhatsAppWorker:
             })
 
         page = self._ensure_page()
-        self._bring_front(page)
 
         if action in {"open","abrir","show","mostrar"}:
+            self._bring_front(page)
             if self._ensure_ready(page):
+                self._sync_account(page)
                 return _dump("WHATSAPP_VERIFIED_OPEN", {
                     "open": True, "backend": "WA-JS", "logged_in": True, "url": page.url
                 })
+            self._clear_candidates()
+            self._account = ""
             return _dump("WHATSAPP_LOGIN_REQUIRED", {
                 "open": True, "backend": "WA-JS", "logged_in": False, "url": page.url
             })
 
         if not self._ensure_ready(page):
+            self._clear_candidates()
+            self._account = ""
             return "WHATSAPP_LOGIN_REQUIRED: WhatsApp Web está abierto, pero WA-JS aún no confirmó una sesión autenticada."
+
+        self._sync_account(page)
+        if action == "forget_contact":
+            if not self._account or not chat:
+                return "WHATSAPP_UNVERIFIED: Olvidar requiere una cuenta autenticada identificada y el alias original."
+            forgotten = forget_whatsapp_contact(self._account, _norm(chat))
+            self._clear_candidates()
+            return _dump("WHATSAPP_CONTACT_FORGOTTEN", {"query": chat, "forgotten": forgotten})
 
         if action in {"status","estado","is_open","esta_abierto"}:
             active = self._active_chat(page)
@@ -962,7 +1092,10 @@ class _WhatsAppWorker:
         if action == "search":
             if not chat:
                 return "WHATSAPP_ERROR: Falta el nombre del chat."
-            best, candidates = self._resolve_chat(page, chat)
+            best, candidates, error = self._resolve_target(page, chat)
+            if error:
+                self._clear_candidates()
+                return _dump("WHATSAPP_UNVERIFIED", error)
             if best:
                 self._clear_candidates()
                 numbered = candidates
@@ -1075,7 +1208,8 @@ class _WhatsAppWorker:
 
             # Last millisecond guard: never send if WhatsApp's active id changed.
             active_now = self._active_chat(page)
-            if not active_now or active_now.get("id") != chat_id:
+            if (not active_now or active_now.get("id") != chat_id
+                    or (self._account and self._account_id(page) != self._account)):
                 return _dump("WHATSAPP_SEND_BLOCKED_WRONG_RECIPIENT", {
                     "requested": chat or chat_name,
                     "expected": {"id": chat_id, "name": chat_name},
@@ -1127,12 +1261,15 @@ TOOL = {
         "resuelve chats/contactos, conoce el chat activo, abre, lee y envía sin depender "
         "de selectores DOM del encabezado o del cuadro de mensaje. "
         "Para una orden de envío usa UNA sola llamada action=send. "
+        "Para acceso simple usa open; para operaciones internas conserva la acción específica. "
+        "Las operaciones de chat no traen la ventana al frente; open muestra WhatsApp cuando el usuario lo pide. "
+        "Aprende un alias solo tras selección explícita y verificada; forget_contact olvida la asociación del alias en esta cuenta. "
         "Antes de enviar verifica el destinatario por id exacto. También puede reproducir y, solo cuando se pide, transcribir notas de voz recibidas."
     ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
-            "action": {"type": "STRING", "description": "open | close | status | search | select | read | last_incoming | last_outgoing | last_audio | play_audio | transcribe_audio | stop_audio | send | recent | last | unread"},
+            "action": {"type": "STRING", "description": "open | close | status | search | select | read | last_incoming | last_outgoing | last_audio | play_audio | transcribe_audio | stop_audio | send | recent | last | unread | forget_contact"},
             "chat": {"type": "STRING", "description": "Nombre/apodo del contacto o chat"},
             "candidate_index": {"type": "INTEGER", "description": "Opción 1-5 de la ÚLTIMA lista ambigua. Úsala cuando el usuario diga primero/segundo/tercero."},
             "candidate_id": {"type": "STRING", "description": "ID exacto de una opción de la ÚLTIMA lista ambigua. Nunca inventarlo."},
@@ -1143,4 +1280,5 @@ TOOL = {
         "required": ["action"],
     },
     "handler": whatsapp_web,
+    "pending_context": _WORKER.pending_context,
 }

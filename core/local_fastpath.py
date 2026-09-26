@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import os,re,subprocess,time
+from core.capabilities import resource_owner
 @dataclass
 class FastResult:
     handled: bool
@@ -23,6 +24,7 @@ def _dur(q):
 def handle(text):
     raw=str(text or "").strip(); q=raw.lower()
     if not q:return FastResult(False)
+    if resource_owner(raw):return FastResult(False)
     if any(x in q for x in ("qué hora","que hora","dime la hora","hora es")):
         h=datetime.now().strftime("%I:%M %p").lstrip("0"); return FastResult(True,True,f"Son las {h}.",f"Son las {h}.","LOCAL // hora")
     if ("captura" in q and "pantalla" in q) or "screenshot" in q:
@@ -40,7 +42,7 @@ def handle(text):
             item=re.sub(r'\b(?:en|dentro de)\s+\d+\s*(?:segundos?|minutos?|horas?|s|min|h)\b.*$','',item,flags=re.I).strip(" ,.") or "eso"
             _schedule(s,"KIRA // RECORDATORIO",f"Recuerda: {item}")
             return FastResult(True,True,f"Recordatorio creado: {item}.",f"Listo. Te recordaré {item}.","LOCAL // recordatorio")
-    apps={"whatsapp":"WhatsApp","chrome":"Google Chrome","spotify":"Spotify","safari":"Safari","terminal":"Terminal","vscode":"Visual Studio Code","finder":"Finder","correo":"Mail"}
+    apps={"chrome":"Google Chrome","spotify":"Spotify","safari":"Safari","terminal":"Terminal","vscode":"Visual Studio Code","finder":"Finder","correo":"Mail"}
     if q.startswith(("abre ","abrir ","inicia ","lanza ")):
         for k,a in apps.items():
             if k in q:

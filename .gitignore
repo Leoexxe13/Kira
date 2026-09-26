@@ -20,6 +20,8 @@ config/whatsapp_web/
 
 # ── Personal data the assistant accumulates about you ─────────────────────────
 memory/long_term.json
+memory/whatsapp_contacts.json
+memory/.whatsapp_contacts.*.tmp
 memory/*.db
 memory/kira_tasks.json
 memory/kira_startup_state.json

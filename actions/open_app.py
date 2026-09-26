@@ -1,3 +1,5 @@
+from core.capabilities import generic_target_owner, reserved_result
+
 import time
 import subprocess
 import platform
@@ -20,7 +22,6 @@ _APP_ALIASES: dict[str, dict[str, str]] = {
     "brave":              {"Windows": "brave",                   "Darwin": "Brave Browser",        "Linux": "brave-browser"},
     "safari":             {"Windows": "msedge",                  "Darwin": "Safari",               "Linux": "firefox"},
     "opera":              {"Windows": "opera",                   "Darwin": "Opera",                "Linux": "opera"},
-    "whatsapp":           {"Windows": "WhatsApp",                "Darwin": "WhatsApp",             "Linux": "whatsapp"},
     "telegram":           {"Windows": "Telegram",                "Darwin": "Telegram",             "Linux": "telegram"},
     "discord":            {"Windows": "Discord",                 "Darwin": "Discord",              "Linux": "discord"},
     "slack":              {"Windows": "Slack",                   "Darwin": "Slack",                "Linux": "slack"},
@@ -243,6 +244,9 @@ def open_app(
     player=None,
     session_memory=None,
 ) -> str:
+    owner = generic_target_owner("open_app", parameters or {})
+    if owner:
+        return reserved_result(owner)
     app_name = (parameters or {}).get("app_name", "").strip()
 
     if not app_name:
@@ -276,13 +280,13 @@ def open_app(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "open_app",
-    "description": "Opens any application on the computer. Use this whenever the user asks to open, launch, or start any app, website, or program. Always call this tool — never just say you opened it.",
+    "description": "Opens generic applications. Specialized resources such as WhatsApp belong exclusively to their own tool (whatsapp_web), including simple access. Never use this tool for operations inside those resources.",
     "parameters": {
         "type": "OBJECT",
         "properties": {
             "app_name": {
                 "type": "STRING",
-                "description": "Exact name of the application (e.g. 'WhatsApp', 'Chrome', 'Spotify')"
+                "description": "Exact name of the application (e.g. 'Chrome', 'Spotify')"
             }
         },
         "required": [
@@ -291,20 +295,3 @@ TOOL = {
     },
     "handler": open_app,
 }
-
-# === KIRA_WHATSAPP_EXCLUSIVE_ROUTE_V2 ===
-try:
-    _KIRA_ORIGINAL_TOOL_HANDLER_V2 = TOOL.get("handler")
-except Exception:
-    _KIRA_ORIGINAL_TOOL_HANDLER_V2 = None
-if callable(_KIRA_ORIGINAL_TOOL_HANDLER_V2):
-    def _kira_whatsapp_route_guard_v2(*args, **kwargs):
-        params = args[0] if args and isinstance(args[0], dict) else kwargs.get("parameters", {})
-        params = params if isinstance(params, dict) else {}
-        joined = " ".join(str(v) for v in params.values()).lower()
-        action = str(params.get("action", "")).lower()
-        if "web.whatsapp.com" in joined or ("whatsapp" in joined and action in {"open","abrir","new_tab","navigate","go","send","message"}):
-            return "KIRA_ROUTE_BLOCKED: WhatsApp está reservado para whatsapp_web. No se abrió Safari, Chrome ni una app alternativa."
-        return _KIRA_ORIGINAL_TOOL_HANDLER_V2(*args, **kwargs)
-    TOOL["handler"] = _kira_whatsapp_route_guard_v2
-# === END_KIRA_WHATSAPP_EXCLUSIVE_ROUTE_V2 ===

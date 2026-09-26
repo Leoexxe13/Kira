@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>KIRA Remote</title>
+  <title>JARVIS Remote</title>
   <script src="/static/crypto.js"></script>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -137,7 +137,7 @@
 <body>
   <div id="toast"></div>
   <header>
-    <div class="logo">KIRA</div>
+    <div class="logo">JARVIS</div>
     <div class="pill" id="pill"><span class="dot"></span><span id="st">Connecting</span></div>
     <div class="enc-badge" id="enc">AES-256</div>
     <div class="spacer"></div>
@@ -145,7 +145,7 @@
   </header>
   <main id="feed"></main>
   <footer>
-    <input id="inp" placeholder="Escribe a KIRA…" autocomplete="off">
+    <input id="inp" placeholder="Escribe a JARVIS…" autocomplete="off">
     <label class="btn-attach" for="file-inp" title="Send file">📎</label>
     <input type="file" id="file-inp" multiple accept="*/*" style="display:none">
     <button id="mic-btn" onclick="doMic()" title="Voice command">🎤</button>
@@ -299,15 +299,15 @@
           _retryMs = 900;
           pill.className = 'pill on';
           stTxt.textContent = 'Connected';
-          sys('KIRA Remote activa.');
-          toast('Conectado a KIRA');
+          sys('JARVIS Remote activa.');
+          toast('Conectado a JARVIS');
         };
 
         sock.onmessage = (e) => {
           const m = JSON.parse(e.data);
           if (m.type === 'log')           append(m.speaker, m.text);
           if (m.type === 'status')        setStatus(m.state);
-          if (m.type === 'wake')          sys('KIRA está despertando…');
+          if (m.type === 'wake')          sys('JARVIS está despertando…');
           if (m.type === 'sys')           sys(m.text);
           if (m.type === 'file_received') _onFileReceived(m);
         };
@@ -346,7 +346,7 @@
       const d = document.createElement('div');
       if (speaker === 'jarvis') {
         d.className = 'msg msg-j';
-        d.innerHTML = `<div class="lbl">KIRA</div>${esc(text)}`;
+        d.innerHTML = `<div class="lbl">JARVIS</div>${esc(text)}`;
       } else {
         d.className = 'msg msg-u';
         d.innerHTML = `<div class="lbl">You</div>${esc(text)}`;

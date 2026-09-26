@@ -477,3 +477,82 @@ def pop_last_session() -> dict | None:
         except Exception as e:
             print(f"[Memory] ⚠️ pop_last_session error: {e}")
             return None
+
+
+# Technical resolution memory. This is intentionally excluded from the general
+# facts store, prompt, recall and model-driven save_memory updates. user_name is
+# a display setting, not a user ID; the authenticated WhatsApp account scopes it.
+WHATSAPP_CONTACTS_PATH = BASE_DIR / "memory" / "whatsapp_contacts.json"
+
+
+def _read_whatsapp_contacts() -> dict:
+    # Caller holds _lock. Corruption is an error, never an empty store to replace.
+    if not WHATSAPP_CONTACTS_PATH.exists():
+        return {"version": 1, "accounts": {}}
+    data = json.loads(WHATSAPP_CONTACTS_PATH.read_text(encoding="utf-8"))
+    if not isinstance(data, dict) or data.get("version") != 1 or not isinstance(data.get("accounts"), dict):
+        raise ValueError("Invalid WhatsApp resolution memory")
+    for account, aliases in data["accounts"].items():
+        if not isinstance(account, str) or not account or not isinstance(aliases, dict):
+            raise ValueError("Invalid WhatsApp account memory")
+        for alias, entry in aliases.items():
+            if (not isinstance(alias, str) or not alias or not isinstance(entry, dict)
+                    or any(not isinstance(entry.get(k), str) or not entry[k]
+                           for k in ("id", "name", "confirmed_at"))):
+                raise ValueError("Invalid WhatsApp contact memory")
+    return data
+
+
+def _write_whatsapp_contacts(data: dict) -> None:
+    import os
+    import tempfile
+    WHATSAPP_CONTACTS_PATH.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".whatsapp_contacts.", suffix=".tmp",
+                                     dir=WHATSAPP_CONTACTS_PATH.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            json.dump(data, stream, ensure_ascii=False, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, WHATSAPP_CONTACTS_PATH)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def get_whatsapp_contact(account: str, alias: str) -> dict | None:
+    if not account or not alias:
+        return None
+    with _lock:
+        entry = _read_whatsapp_contacts()["accounts"].get(account, {}).get(alias)
+        return dict(entry) if entry else None
+
+
+def remember_whatsapp_contact(account: str, alias: str, chat_id: str, name: str) -> None:
+    """Called only after an explicit candidate choice and exact-ID verification."""
+    if not all(isinstance(v, str) and v.strip() for v in (account, alias, chat_id, name)):
+        raise ValueError("WhatsApp resolution requires account, alias and identity")
+    with _lock:
+        data = _read_whatsapp_contacts()
+        aliases = data["accounts"].setdefault(account, {})
+        previous = aliases.get(alias)
+        if previous and previous["id"] != chat_id:
+            raise ValueError("Forget the previous association before replacing it")
+        aliases[alias] = {"id": chat_id, "name": name,
+                          "confirmed_at": datetime.now().isoformat(timespec="seconds")}
+        _write_whatsapp_contacts(data)
+
+
+def forget_whatsapp_contact(account: str, alias: str) -> bool:
+    if not account or not alias:
+        raise ValueError("WhatsApp account and alias required")
+    with _lock:
+        data = _read_whatsapp_contacts()
+        aliases = data["accounts"].get(account, {})
+        if alias not in aliases:
+            return False
+        del aliases[alias]
+        if not aliases:
+            data["accounts"].pop(account, None)
+        _write_whatsapp_contacts(data)
+        return True

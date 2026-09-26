@@ -33,6 +33,7 @@ import traceback
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+from core.capabilities import generic_target_owner, resource_owner, reserved_result
 
 _NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]{0,63}$")
 _DEFAULT_PARAMS = {"type": "OBJECT", "properties": {}}
@@ -48,6 +49,7 @@ class ActionRecord:
     file: str = ""
     valid: bool = False
     error: str = ""
+    pending_context: Optional[Callable] = None
 
 
 class ActionRegistry:
@@ -69,8 +71,20 @@ class ActionRegistry:
     def names(self) -> set[str]:
         return set(self._actions.keys())
 
+    def pending_contexts(self) -> dict:
+        return {name: context for name, rec in self._actions.items()
+                if rec.pending_context and (context := rec.pending_context())}
+
     # -- called by main.py from _execute_tool --
     def run(self, name: str, parameters: dict, ctx: dict | None = None) -> str:
+        owner = generic_target_owner(name, parameters)
+        if owner:
+            # open_app's schema represents access only. An operation embedded in
+            # app_name is not safe to downgrade; ask the semantic resolver again.
+            if (name == "open_app" and set(parameters) == {"app_name"}
+                    and resource_owner(parameters.get("app_name"), exact=True)):
+                return self.run(owner, {"action": "open"}, ctx)
+            return reserved_result(owner)
         rec = self._actions.get(name)
         if rec is None or not rec.valid:
             return f"Action '{name}' is not available."
@@ -123,7 +137,8 @@ def _validate(module, filename: str) -> ActionRecord:
                             error="TOOL['handler'] missing or not callable.")
 
     return ActionRecord(name=name, description=description.strip(), parameters=parameters,
-                        handler=handler, file=filename, valid=True, error="")
+                        handler=handler, file=filename, valid=True, error="",
+                        pending_context=tool.get("pending_context") if callable(tool.get("pending_context")) else None)
 
 
 def discover_actions(actions_dir: Path, reserved_names: set[str] | None = None,

@@ -43,7 +43,7 @@ from PyQt6.QtWidgets import (
 # Mark 52 and 53 shipped showing "PROTOCOL XLIX" — the number from Mark 49 — and
 # Mark 55 shipped titled "MARK 54". Deriving the protocol from the name means a
 # release bump is this one line.
-APP_VERSION  = "KIRA // BLACK OPS"
+APP_VERSION  = "JARVIS // BLACK OPS"
 APP_PROTOCOL = "BLACK OPS"
 
 # === KIRA_BLACKOPS_RECOVERY_V1 ===
@@ -384,7 +384,7 @@ class _SysMetrics:
 _metrics = _SysMetrics()
 
 class HudCanvas(QWidget):
-    def __init__(self, face_path: str, assistant_name: str = "KIRA", parent=None):
+    def __init__(self, face_path: str, assistant_name: str = "JARVIS", parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
         self.setMinimumSize(300, 300)
@@ -2921,9 +2921,9 @@ class RemoteKeyOverlay(QWidget):
 
 # === KIRA_BLACKOPS_WORKSPACE_V2 ===
 class KiraBubbleLog(QTextEdit):
-    def __init__(self, assistant_name="KIRA", parent=None):
+    def __init__(self, assistant_name="JARVIS", parent=None):
         super().__init__(parent)
-        self._ai_name_lc = str(assistant_name or "KIRA").lower()
+        self._ai_name_lc = str(assistant_name or "JARVIS").lower()
         self.setReadOnly(True)
         self.setAcceptRichText(True)
         self.setFont(QFont("Courier New", 11))
@@ -2960,7 +2960,7 @@ class KiraBubbleLog(QTextEdit):
                 "<div style='text-align:left; margin:8px 0;'>"
                 "<span style='background:#121212; color:#F5F5F5; border:1px solid #3D3D3D; "
                 "border-radius:12px; padding:9px 12px; font-size:13px;'>"
-                f"{body}</span><br><span style='color:#8A8A8A; font-size:9px;'>KIRA · {ts}</span></div>"
+                f"{body}</span><br><span style='color:#8A8A8A; font-size:9px;'>JARVIS · {ts}</span></div>"
             )
         else:
             html = (
@@ -2978,9 +2978,9 @@ class KiraBubbleLog(QTextEdit):
 
 class KiraChatFeed(QScrollArea):
     # Chat visual real: usuario a la derecha, KIRA a la izquierda.
-    def __init__(self, assistant_name="KIRA", parent=None):
+    def __init__(self, assistant_name="JARVIS", parent=None):
         super().__init__(parent)
-        self._assistant_name = assistant_name or "KIRA"
+        self._assistant_name = assistant_name or "JARVIS"
         self.setWidgetResizable(True)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -3057,7 +3057,9 @@ class MainWindow(QMainWindow):
 
         # Load customization from config
         _cfg = _read_full_config()
-        self._assistant_name: str = (_cfg.get("assistant_name") or "KIRA").strip()
+        self._assistant_name: str = (_cfg.get("assistant_name") or "JARVIS").strip()
+        if self._assistant_name.casefold() == "kira":
+            self._assistant_name = "JARVIS"
         _display = self._assistant_name.upper()
 
         # Apply the saved UI colour BEFORE panels/stylesheets are built
@@ -3065,7 +3067,7 @@ class MainWindow(QMainWindow):
         if _ui_color and _ui_color.lower() != DEFAULT_UI_COLOR:
             apply_ui_accent(_ui_color)
 
-        self.setWindowTitle("KIRA // BLACK OPS")
+        self.setWindowTitle("JARVIS // BLACK OPS")
         self.setMinimumSize(_MIN_W, _MIN_H)
         self.resize(_DEFAULT_W, _DEFAULT_H)
 
@@ -3179,7 +3181,7 @@ class MainWindow(QMainWindow):
         _kira_layout = QVBoxLayout(self._kira_page)
         _kira_layout.setContentsMargins(12, 10, 12, 10)
         _kira_layout.setSpacing(8)
-        _kira_title = QLabel("KIRA // CORE")
+        _kira_title = QLabel("JARVIS // CORE")
         _kira_title.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
         _kira_title.setStyleSheet(
             f"color:{C.WHITE}; background:transparent; letter-spacing:2px;"
@@ -3319,7 +3321,7 @@ class MainWindow(QMainWindow):
         v.setSpacing(6)
 
         h = QHBoxLayout()
-        title = QLabel("KIRA // CONTEXTO ACTIVO")
+        title = QLabel("JARVIS // CONTEXTO ACTIVO")
         title.setFont(QFont("Courier New", 8, QFont.Weight.Bold))
         title.setStyleSheet(f"color:{C.WHITE}; background:transparent; border:none;")
         h.addWidget(title)
@@ -3440,7 +3442,7 @@ class MainWindow(QMainWindow):
         c.setContentsMargins(10,8,10,8)
 
         ch = QHBoxLayout()
-        ct = QLabel("KIRA CORE")
+        ct = QLabel("JARVIS CORE")
         ct.setFont(QFont("Courier New",10,QFont.Weight.Bold))
         ct.setStyleSheet("color:#f4f4f4;background:transparent;border:none;")
         ch.addWidget(ct)
@@ -3681,7 +3683,7 @@ class MainWindow(QMainWindow):
             self._tasks_pending_count.setText(f"{len(pending)} PENDIENTES")
 
         if not self._kira_tasks:
-            empty = QLabel("No tienes pendientes.\nDile a KIRA: “tengo que…” o agrégalo aquí.")
+            empty = QLabel("No tienes pendientes.\nDile a JARVIS: “tengo que…” o agrégalo aquí.")
             empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
             empty.setFont(QFont("Courier New", 10))
             empty.setStyleSheet(
@@ -3827,7 +3829,7 @@ class MainWindow(QMainWindow):
             self._sync_tasks_from_disk()
             ans = self._task_summary()
             try:
-                self._log.append_log(f"KIRA: {ans}")
+                self._log.append_log(f"JARVIS: {ans}")
             except Exception:
                 pass
             self._speak_local_task_summary(ans)
@@ -3848,7 +3850,7 @@ class MainWindow(QMainWindow):
         if any(low.startswith(x) for x in add_signals):
             if self._add_kira_task(txt):
                 try:
-                    self._log.append_log("KIRA: Lo guardé en PENDIENTES.")
+                    self._log.append_log("JARVIS: Lo guardé en PENDIENTES.")
                 except Exception:
                     pass
                 try:
@@ -4050,7 +4052,7 @@ class MainWindow(QMainWindow):
             title = "BRIEFING // STATUS"
             txt = (
                 "No se encontraron noticias verificadas para esa consulta.\\n\\n"
-                "KIRA sigue disponible.\\n"
+                "JARVIS sigue disponible.\\n"
                 "• Prueba otra búsqueda.\\n"
                 "• Revisa actividad reciente.\\n"
                 "• El sistema y el contexto continúan activos."
@@ -4622,7 +4624,7 @@ class MainWindow(QMainWindow):
 
         add_btn("INICIO", "home")
         add_btn("SISTEMA", "system")
-        add_btn("KIRA", "kira")
+        add_btn("JARVIS", "kira")
         add_btn("TAREAS", "tasks")
         add_btn("CHAT", "chat")
         return bar
@@ -5154,7 +5156,7 @@ class MainWindow(QMainWindow):
         if str(text or "").strip().lower().startswith("no news found"):
             title = "BRIEFING // STATUS"
             text = ("No se encontraron noticias verificadas para esa consulta.\n\n"
-                    "KIRA está lista. Puedes intentar otra búsqueda o revisar HOME.")
+                    "JARVIS está lista. Puedes intentar otra búsqueda o revisar HOME.")
         import time as _time
         self._content_title_lbl.setText(title.upper()[:48])
         self._content_ts_lbl.setText(_time.strftime("%H:%M:%S"))

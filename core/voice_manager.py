@@ -20,6 +20,9 @@ DEFAULTS = {
     "gemini_start_timeout_seconds": 2.8,
     "idle_mic_after_seconds": 180,
     "idle_wake_level": 0.055,
+    "audio_vad_enabled": True,
+    "audio_vad_aggressiveness": 2,
+    "audio_vad_voiced_ratio": 0.30,
 }
 
 def load_config() -> dict:
@@ -47,11 +50,13 @@ def sanitize_for_speech(text: str) -> str:
     return re.sub(r"\s+", " ", s).strip()[:2600]
 
 class VoiceManager:
-    def __init__(self, logger=None):
+    def __init__(self, logger=None, playback=None):
         self.logger = logger or (lambda _m: None)
         self._lock: Optional[asyncio.Lock] = None
         self._proc = None
         self._generation = 0
+        self._playback = playback
+        self._loop = None
 
     def _get_lock(self):
         if self._lock is None:
@@ -61,12 +66,15 @@ class VoiceManager:
     def stop_now(self) -> None:
         self._generation += 1
         p = self._proc
-        self._proc = None
         if p is not None:
-            try:
-                p.terminate()
-            except Exception:
-                pass
+            def terminate():
+                try:
+                    if p.returncode is None:
+                        p.terminate()
+                except ProcessLookupError:
+                    pass
+            if self._loop and self._loop.is_running():
+                self._loop.call_soon_threadsafe(terminate)
 
     async def speak_edge(self, text: str, reason: str = "fallback") -> bool:
         cfg = load_config()
@@ -81,9 +89,15 @@ class VoiceManager:
             self.logger(f"ERR: Edge TTS no disponible // {e}")
             return False
 
+        generation = self._generation
         async with self._get_lock():
-            generation = self._generation
+            if generation != self._generation:
+                return False
+            self._loop = asyncio.get_running_loop()
             tmp = None
+            proc = None
+            playback_token = object()
+            spawn_task = None
             try:
                 fd, name = tempfile.mkstemp(prefix="kira_voice_", suffix=".mp3")
                 import os
@@ -99,24 +113,46 @@ class VoiceManager:
                 if generation != self._generation:
                     return False
                 self.logger(f"SYS: voz // Edge respaldo ({reason})")
-                self._proc = await asyncio.create_subprocess_exec(
+                if self._playback:
+                    self._playback.start(playback_token)
+                spawn_task = asyncio.create_task(asyncio.create_subprocess_exec(
                     "afplay", str(tmp),
                     stdout=asyncio.subprocess.DEVNULL,
                     stderr=asyncio.subprocess.DEVNULL,
-                )
-                rc = await self._proc.wait()
-                self._proc = None
-                return rc == 0
+                ))
+                proc = await asyncio.shield(spawn_task)
+                self._proc = proc
+                if generation != self._generation:
+                    proc.terminate()
+                rc = await proc.wait()
+                return rc == 0 and generation == self._generation
             except asyncio.CancelledError:
                 self.stop_now()
                 raise
             except Exception as e:
-                self._proc = None
                 self.logger(f"ERR: Edge TTS // {e}")
                 return False
             finally:
-                if tmp is not None:
-                    try:
-                        tmp.unlink(missing_ok=True)
-                    except Exception:
-                        pass
+                try:
+                    # Cancellation during spawn must not orphan afplay or open
+                    # capture while the child is still producing sound.
+                    if proc is None and spawn_task is not None:
+                        try:
+                            proc = await asyncio.shield(spawn_task)
+                        except Exception:
+                            pass
+                    if proc is not None and proc.returncode is None:
+                        try:
+                            proc.terminate()
+                        except ProcessLookupError:
+                            pass
+                        await proc.wait()
+                finally:
+                    self._proc = None
+                    if self._playback:
+                        self._playback.stop(playback_token)
+                    if tmp is not None:
+                        try:
+                            tmp.unlink(missing_ok=True)
+                        except Exception:
+                            pass
