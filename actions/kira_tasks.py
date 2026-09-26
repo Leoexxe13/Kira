@@ -2,24 +2,93 @@ import json
 import time
 from pathlib import Path
 
+from memory import db
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 TASK_FILE = BASE_DIR / "memory" / "kira_tasks.json"
 
-def _load():
+
+def _get_db_path() -> Path:
+    if TASK_FILE != BASE_DIR / "memory" / "kira_tasks.json":
+        return TASK_FILE.parent / "kira_memory.db"
+    return BASE_DIR / "memory" / "kira_memory.db"
+
+
+def _load() -> list[dict]:
+    db_path = _get_db_path()
     try:
-        data = json.loads(TASK_FILE.read_text(encoding="utf-8"))
-        return data if isinstance(data, list) else []
-    except Exception:
+        db.init_db(db_path)
+        rows = db.list_tasks(include_done=True, db_path=db_path)
+        return [
+            {
+                "id": r["id"],
+                "text": r["text"],
+                "done": bool(r["done"]),
+                "created": r["created_at"],
+                "completed": r["completed_at"] or "",
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        print(f"[Tasks] ⚠️ SQLite load error: {e}")
         return []
 
-def _save(tasks):
-    TASK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    TASK_FILE.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _save(tasks: list[dict]) -> None:
+    # Kept for backward compatibility if invoked directly
+    if not isinstance(tasks, list):
+        return
+    db_path = _get_db_path()
+    try:
+        db.init_db(db_path)
+        for t in tasks:
+            t_id = t.get("id")
+            text = str(t.get("text", "")).strip()
+            if not text:
+                continue
+            done = 1 if t.get("done") else 0
+            created = str(t.get("created", "")).strip() or time.strftime("%Y-%m-%d %H:%M:%S")
+            completed = str(t.get("completed", "")).strip() or None
+            conn = db.get_connection(db_path)
+            try:
+                with conn:
+                    if t_id is not None:
+                        conn.execute(
+                            """
+                            INSERT INTO tasks (id, text, done, created_at, completed_at)
+                            VALUES (?, ?, ?, ?, ?)
+                            ON CONFLICT(id) DO UPDATE SET
+                                text = excluded.text,
+                                done = excluded.done,
+                                created_at = excluded.created_at,
+                                completed_at = excluded.completed_at
+                            """,
+                            (int(t_id), text, done, created, completed),
+                        )
+                    else:
+                        conn.execute(
+                            """
+                            INSERT INTO tasks (text, done, created_at, completed_at)
+                            VALUES (?, ?, ?, ?)
+                            """,
+                            (text, done, created, completed),
+                        )
+            finally:
+                conn.close()
+
+        if TASK_FILE != BASE_DIR / "memory" / "kira_tasks.json":
+            TASK_FILE.parent.mkdir(parents=True, exist_ok=True)
+            TASK_FILE.write_text(json.dumps(tasks, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        print(f"[Tasks] ⚠️ SQLite save error: {e}")
+
 
 def kira_tasks(parameters: dict, response=None, player=None, session_memory=None) -> str:
     action = str(parameters.get("action", "list")).lower().strip()
     text = str(parameters.get("text", "")).strip()
     task_id = parameters.get("id")
+    db_path = _get_db_path()
+    db.init_db(db_path)
     tasks = _load()
 
     if action == "list":
@@ -32,14 +101,10 @@ def kira_tasks(parameters: dict, response=None, player=None, session_memory=None
     if action == "add":
         if not text:
             return "Necesito saber qué pendiente quieres guardar."
-        next_id = max([int(t.get("id", 0)) for t in tasks] + [0]) + 1
-        tasks.append({
-            "id": next_id,
-            "text": text,
-            "done": False,
-            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
-        })
-        _save(tasks)
+        now = time.strftime("%Y-%m-%d %H:%M:%S")
+        db.add_task(text, created_at=now, db_path=db_path)
+        if TASK_FILE != BASE_DIR / "memory" / "kira_tasks.json":
+            _save(_load())
         return f"Listo. Guardé como pendiente: {text}"
 
     if action in ("complete", "delete"):
@@ -57,33 +122,29 @@ def kira_tasks(parameters: dict, response=None, player=None, session_memory=None
         if wanted is None:
             return "No pude identificar cuál pendiente quieres modificar."
 
-        found = False
-        if action == "complete":
-            result = ""
-            for t in tasks:
-                if int(t.get("id", 0)) == wanted:
-                    t["done"] = True
-                    t["completed"] = time.strftime("%Y-%m-%d %H:%M:%S")
-                    found = True
-                    result = f"Marcado como hecho: {t.get('text','')}"
-                    break
-        else:
-            new_tasks = []
-            result = ""
-            for t in tasks:
-                if int(t.get("id", 0)) == wanted:
-                    found = True
-                    result = f"Eliminé el pendiente: {t.get('text','')}"
-                else:
-                    new_tasks.append(t)
-            tasks = new_tasks
+        target_task = None
+        for t in tasks:
+            if int(t.get("id", 0)) == wanted:
+                target_task = t
+                break
 
-        if not found:
+        if not target_task:
             return "No encontré ese pendiente."
-        _save(tasks)
-        return result
+
+        if action == "complete":
+            now = time.strftime("%Y-%m-%d %H:%M:%S")
+            db.complete_task(wanted, completed_at=now, db_path=db_path)
+            if TASK_FILE != BASE_DIR / "memory" / "kira_tasks.json":
+                _save(_load())
+            return f"Marcado como hecho: {target_task.get('text','')}"
+        else:
+            db.delete_task(wanted, db_path=db_path)
+            if TASK_FILE != BASE_DIR / "memory" / "kira_tasks.json":
+                _save(_load())
+            return f"Eliminé el pendiente: {target_task.get('text','')}"
 
     return "Acción de pendientes no reconocida."
+
 
 TOOL = {
     "name": "kira_tasks",
