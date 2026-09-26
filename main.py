@@ -954,9 +954,23 @@ class JarvisLive:
         if self._wake_enabled and not self._awake:
             self.ui.write_log("SYS: I'm asleep — say 'Hey Jarvis' or tap WAKE NOW first.")
             return
+
+        final_text = text
+        _txt_stripped = str(text).strip()
+        # Avoid retrieving memory for trivial greetings and short nonsense
+        _skip_greetings = {"hola", "hello", "hi", "hey", "buenos días", "buenas tardes", "buenas noches", "gracias", "adios", "adiós", "chau"}
+        if len(_txt_stripped) > 5 and _txt_stripped.lower() not in _skip_greetings:
+            try:
+                from memory.memory_manager import search_memory
+                results = search_memory(_txt_stripped, limit=3)
+                if results and "No matching memories found" not in results and "No se encontraron" not in results and "Nothing stored about" not in results:
+                    final_text = f"{text}\n\n[RELEVANT MEMORY]\n{results}\n[/RELEVANT MEMORY]"
+            except Exception as e:
+                print(f"[Memory Context] FTS5 retrieval failed: {e}")
+
         self._schedule_coro(
             self.session.send_client_content(
-                turns={"role": "user", "parts": [{"text": text}]},
+                turns={"role": "user", "parts": [{"text": final_text}]},
                 turn_complete=True
             ),
             label="chat"

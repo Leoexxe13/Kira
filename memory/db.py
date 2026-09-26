@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import sqlite3
 import sys
 from datetime import datetime
@@ -28,6 +29,26 @@ def get_connection(db_path: Path | str | None = None) -> sqlite3.Connection:
         conn.execute("PRAGMA journal_mode = WAL;")
         conn.execute("PRAGMA synchronous = NORMAL;")
     return conn
+
+
+def is_fts5_available(conn: sqlite3.Connection | None = None) -> bool:
+    """Check if the SQLite library has FTS5 module enabled."""
+    should_close = False
+    if conn is None:
+        conn = sqlite3.connect(":memory:")
+        should_close = True
+    try:
+        cur = conn.execute("SELECT 1 FROM pragma_compile_options WHERE compile_options = 'ENABLE_FTS5';")
+        if cur.fetchone():
+            return True
+        conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS _test_fts5 USING fts5(x);")
+        conn.execute("DROP TABLE IF EXISTS _test_fts5;")
+        return True
+    except Exception:
+        return False
+    finally:
+        if should_close:
+            conn.close()
 
 
 def init_db(db_path: Path | str | None = None) -> None:
@@ -87,6 +108,67 @@ def init_db(db_path: Path | str | None = None) -> None:
                 CREATE INDEX IF NOT EXISTS idx_audit_target ON memory_audit_log(target_table, record_id);
                 """
             )
+
+            # Setup FTS5 virtual tables and automatic synchronization triggers if supported
+            if is_fts5_available(conn):
+                conn.executescript(
+                    """
+                    CREATE VIRTUAL TABLE IF NOT EXISTS facts_fts USING fts5(
+                        category,
+                        key,
+                        value,
+                        content=facts,
+                        content_rowid=id
+                    );
+
+                    CREATE TRIGGER IF NOT EXISTS facts_ai AFTER INSERT ON facts BEGIN
+                        INSERT INTO facts_fts(rowid, category, key, value)
+                        VALUES (new.id, new.category, new.key, new.value);
+                    END;
+
+                    CREATE TRIGGER IF NOT EXISTS facts_ad AFTER DELETE ON facts BEGIN
+                        INSERT INTO facts_fts(facts_fts, rowid, category, key, value)
+                        VALUES ('delete', old.id, old.category, old.key, old.value);
+                    END;
+
+                    CREATE TRIGGER IF NOT EXISTS facts_au AFTER UPDATE ON facts BEGIN
+                        INSERT INTO facts_fts(facts_fts, rowid, category, key, value)
+                        VALUES ('delete', old.id, old.category, old.key, old.value);
+                        INSERT INTO facts_fts(rowid, category, key, value)
+                        VALUES (new.id, new.category, new.key, new.value);
+                    END;
+
+                    CREATE VIRTUAL TABLE IF NOT EXISTS sessions_fts USING fts5(
+                        summary,
+                        date,
+                        content=sessions,
+                        content_rowid=id
+                    );
+
+                    CREATE TRIGGER IF NOT EXISTS sessions_ai AFTER INSERT ON sessions BEGIN
+                        INSERT INTO sessions_fts(rowid, summary, date)
+                        VALUES (new.id, new.summary, new.date);
+                    END;
+
+                    CREATE TRIGGER IF NOT EXISTS sessions_ad AFTER DELETE ON sessions BEGIN
+                        INSERT INTO sessions_fts(sessions_fts, rowid, summary, date)
+                        VALUES ('delete', old.id, old.summary, old.date);
+                    END;
+
+                    CREATE TRIGGER IF NOT EXISTS sessions_au AFTER UPDATE ON sessions BEGIN
+                        INSERT INTO sessions_fts(sessions_fts, rowid, summary, date)
+                        VALUES ('delete', old.id, old.summary, old.date);
+                        INSERT INTO sessions_fts(rowid, summary, date)
+                        VALUES (new.id, new.summary, new.date);
+                    END;
+                    """
+                )
+                # Rebuild FTS indices to index any pre-existing rows seamlessly
+                try:
+                    conn.execute("INSERT INTO facts_fts(facts_fts) VALUES('rebuild');")
+                    conn.execute("INSERT INTO sessions_fts(sessions_fts) VALUES('rebuild');")
+                except Exception:
+                    pass
     finally:
         conn.close()
 
@@ -574,3 +656,75 @@ def get_audit_log(
         return [dict(r) for r in cur.fetchall()]
     finally:
         conn.close()
+
+
+# ── FTS5 Full-Text Search API ──────────────────────────────────────────────────
+
+def sanitize_fts_query(query: str) -> str:
+    """Extract alpha-numeric tokens and format for FTS5 prefix matching."""
+    tokens = [re.sub(r"[^\w\u00C0-\u017F]+", "", w) for w in (query or "").split()]
+    tokens = [t for t in tokens if len(t) > 1]
+    if not tokens:
+        return ""
+    # "tok1"* OR "tok2"*
+    return " OR ".join(f'"{t}"*' for t in tokens)
+
+
+def search_memory_fts(
+    query: str, limit: int = 8, db_path: Path | str | None = None
+) -> list[dict[str, Any]]:
+    """
+    Search facts and sessions using FTS5 with BM25 ranking.
+    Returns list of dicts: [{'source': 'fact'|'session', 'category': str, 'key': str, 'value': str, 'score': float}]
+    Ordered by highest relevance first.
+    """
+    fts_query = sanitize_fts_query(query)
+    if not fts_query:
+        return []
+
+    conn = get_connection(db_path)
+    try:
+        if not is_fts5_available(conn):
+            return []
+
+        # Make sure FTS tables exist
+        cur_tbl = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='facts_fts';")
+        if not cur_tbl.fetchone():
+            return []
+
+        # Weights: key & value have higher priority than category.
+        # FTS5 bm25(table, w0, w1, w2) calculates score (more negative = more relevant).
+        # We negate it so higher score = better match.
+        cur = conn.execute(
+            """
+            SELECT
+                'fact' AS source,
+                f.category AS category,
+                f.key AS key,
+                f.value AS value,
+                (-bm25(facts_fts, 5.0, 10.0, 4.0)) AS score
+            FROM facts_fts
+            JOIN facts f ON f.id = facts_fts.rowid
+            WHERE facts_fts MATCH ?
+            UNION ALL
+            SELECT
+                'session' AS source,
+                'sessions' AS category,
+                s.date AS key,
+                s.summary AS value,
+                (-bm25(sessions_fts, 3.0, 1.0) * 0.75) AS score
+            FROM sessions_fts
+            JOIN sessions s ON s.id = sessions_fts.rowid
+            WHERE sessions_fts MATCH ?
+            ORDER BY score DESC
+            LIMIT ?
+            """,
+            (fts_query, fts_query, max(1, limit)),
+        )
+        return [dict(r) for r in cur.fetchall()]
+    except Exception as e:
+        print(f"[Memory] ⚠️ FTS search error: {e}")
+        return []
+    finally:
+        conn.close()
+

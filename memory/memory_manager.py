@@ -314,8 +314,8 @@ def _score(query_words: list[str], cat: str, key: str, value: str) -> int:
     return score
 
 
-def search_memory(query: str, limit: int = 8) -> str:
-    """Find stored facts matching `query`. Backs the recall_memory tool."""
+def _search_memory_fallback(query: str, limit: int = 8) -> str:
+    """Original lexical scoring fallback for empty queries or environments without FTS5."""
     memory = load_memory()
     words  = [w for w in re.split(r"[^\w]+", (query or "").lower()) if len(w) > 1]
 
@@ -342,6 +342,41 @@ def search_memory(query: str, limit: int = 8) -> str:
     more  = (f"\n(+{len(rows) - len(lines)} more — search with a narrower keyword)"
              if len(rows) > len(lines) else "")
     return head + "\n" + "\n".join(lines) + more
+
+
+def search_memory(query: str, limit: int = 8) -> str:
+    """Find stored facts and relevant sessions matching `query`. Backs recall_memory."""
+    q = (query or "").strip()
+    if not q:
+        return _search_memory_fallback("", limit=limit)
+
+    db_path = _get_db_path()
+    try:
+        db.init_db(db_path)
+        fts_results = db.search_memory_fts(q, limit=max(1, limit), db_path=db_path)
+        if fts_results:
+            lines = []
+            seen = set()
+            for r in fts_results:
+                identifier = (r["category"], r["key"], r["value"])
+                if identifier in seen:
+                    continue
+                seen.add(identifier)
+                if r.get("source") == "session":
+                    lines.append(f"session/{r['key']}: {r['value']}")
+                else:
+                    lines.append(f"{r['category']}/{_pretty(r['key'])}: {r['value']}")
+                if len(lines) >= limit:
+                    break
+
+            head = f"Stored facts matching '{q}':"
+            return head + "\n" + "\n".join(lines)
+    except Exception as e:
+        print(f"[Memory] ⚠️ FTS search_memory fallback triggered: {e}")
+
+    # Fallback to lexical substring scoring if FTS5 yields no results or is unavailable
+    return _search_memory_fallback(q, limit=limit)
+
 
 
 def all_entries_for_ui() -> list[dict]:
