@@ -85,7 +85,19 @@ def _compress(img_bytes: bytes, source_format: str = "PNG") -> tuple[bytes, str]
         return img_bytes, f"image/{source_format.lower()}"
 
 
-def _capture_screen() -> tuple[bytes, str]:
+def _capture_screen(window_name: str = None) -> tuple[bytes, str]:
+
+    if window_name and _get_os() == "mac":
+        import subprocess, tempfile
+        # Try to capture specific window by bringing it to front, or using screencapture
+        try:
+            # We'll just bring it to front and capture the whole screen for reliability
+            script = f'tell application "{window_name}" to activate'
+            subprocess.run(['osascript', '-e', script], capture_output=True)
+            import time
+            time.sleep(0.5)
+        except Exception:
+            pass
 
     if not _MSS:
         raise RuntimeError("mss is not installed. Run: pip install mss")

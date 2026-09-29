@@ -1,342 +1,267 @@
-#web_search.py
+"""
+actions/web_search.py
+
+Semantic Web Research and Source Navigation Tool.
+Handles web searches, domain-specific searches, fetching news, reading webpage content,
+and opening URLs natively in the OS browser.
+"""
 import json
+import re
 import sys
+import threading
+import concurrent.futures
+from urllib.parse import quote_plus
 from pathlib import Path
+from typing import Any
+
+# If bs4 is missing, fallback to basic parsing
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+import requests
+
+
+# ── Internal Helpers ─────────────────────────────────────────────────────────
+
+def _is_mac() -> bool:
+    return sys.platform == "darwin"
+
+def _is_win() -> bool:
+    return sys.platform == "win32"
 
 def _get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent.parent
 
-
 BASE_DIR        = _get_base_dir()
 API_CONFIG_PATH = BASE_DIR / "config" / "api_keys.json"
 
-
 def _get_api_key() -> str:
-    with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
-        return json.load(f)["gemini_api_key"]
+    try:
+        with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)["gemini_api_key"]
+    except Exception:
+        return ""
 
 
-def _gemini_search(query: str) -> str:
-    from google import genai
+# ── Web Operations ───────────────────────────────────────────────────────────
 
-    client   = genai.Client(api_key=_get_api_key())
-    response = client.models.generate_content(
-        model="gemini-flash-latest",
-        contents=query,
-        config={"tools": [{"google_search": {}}]},
-    )
-
-    text = ""
-    for part in response.candidates[0].content.parts:
-        if hasattr(part, "text") and part.text:
-            text += part.text
-
-    text = text.strip()
-    if not text:
-        raise ValueError("Gemini returned an empty response.")
-    return text
-
-
-def _ddg_search(query: str, max_results: int = 6) -> list[dict]:
+def op_search(query: str, domain: str = "", max_results: int = 5) -> dict:
+    """Uses DDG for structured search results."""
     try:
         from ddgs import DDGS
     except ImportError:
-        from duckduckgo_search import DDGS
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            return {"error": "Missing library: pip install duckduckgo-search"}
 
-    results = []
-    with DDGS() as ddgs:
-        for r in ddgs.text(query, max_results=max_results):
-            results.append({
-                "title":   r.get("title",  ""),
-                "snippet": r.get("body",   ""),
-                "url":     r.get("href",   ""),
-            })
-    return results
-
-
-def _ddg_news(query: str, max_results: int = 8) -> list[dict]:
-    """DDG news search — returns actual articles, not website homepages."""
-    try:
-        from ddgs import DDGS
-    except ImportError:
-        from duckduckgo_search import DDGS
+    # Apply domain restriction to query if present
+    search_query = query
+    if domain:
+        search_query = f"{query} site:{domain}"
 
     results = []
     try:
         with DDGS() as ddgs:
-            for r in ddgs.news(query, max_results=max_results):
+            # max_results is passed to text() if supported, otherwise manually limited
+            generator = ddgs.text(search_query, max_results=max_results)
+            for r in generator:
+                results.append({
+                    "title":   r.get("title",  ""),
+                    "snippet": r.get("body",   ""),
+                    "url":     r.get("href",   ""),
+                })
+                if len(results) >= max_results:
+                    break
+    except Exception as e:
+        return {"error": f"Search failed: {e}", "results": []}
+
+    return {
+        "action": "search",
+        "query": search_query,
+        "count": len(results),
+        "results": results
+    }
+
+def op_news(query: str, domain: str = "", max_results: int = 5) -> dict:
+    """Uses DDG News for structured news results."""
+    try:
+        from ddgs import DDGS
+    except ImportError:
+        try:
+            from duckduckgo_search import DDGS
+        except ImportError:
+            return {"error": "Missing library: pip install duckduckgo-search"}
+
+    search_query = query
+    if domain:
+        search_query = f"{query} site:{domain}"
+        
+    results = []
+    try:
+        with DDGS() as ddgs:
+            generator = ddgs.news(search_query, max_results=max_results)
+            for r in generator:
                 results.append({
                     "title":   r.get("title",  ""),
                     "snippet": r.get("body",   ""),
                     "url":     r.get("url",    ""),
                     "source":  r.get("source", ""),
                 })
+                if len(results) >= max_results:
+                    break
     except Exception as e:
-        print(f"[WebSearch] ⚠️ DDG news() failed ({e}) — falling back to text search")
-        results = _ddg_search(query, max_results=max_results)
-    return results
+        return {"error": f"News search failed: {e}", "results": []}
 
+    return {
+        "action": "news",
+        "query": search_query,
+        "count": len(results),
+        "results": results
+    }
 
-def _format_ddg(query: str, results: list[dict]) -> str:
-    if not results:
-        return f"No results found for: {query}"
+def op_read_page(url: str) -> dict:
+    """Fetches the URL and extracts text content."""
+    if not url.startswith("http"):
+        url = "https://" + url
 
-    lines = [f"Search results for: {query}\n"]
-    for i, r in enumerate(results, 1):
-        if r.get("title"):   lines.append(f"{i}. {r['title']}")
-        if r.get("snippet"): lines.append(f"   {r['snippet']}")
-        if r.get("url"):     lines.append(f"   Source: {r['url']}")
-        lines.append("")
-    return "\n".join(lines).strip()
-
-
-def _format_news(query: str, results: list[dict]) -> str:
-    if not results:
-        return f"No news found for: {query}"
-
-    lines = [f"Latest news: {query}\n"]
-    for i, r in enumerate(results, 1):
-        title = r.get("title", "")
-        if not title:
-            continue
-        src = f"  [{r['source']}]" if r.get("source") else ""
-        lines.append(f"{i}. {title}{src}")
-        if r.get("snippet"):
-            lines.append(f"   {r['snippet'][:140]}")
-        if r.get("url"):
-            lines.append(f"   {r['url']}")
-        lines.append("")
-    return "\n".join(lines).strip()
-
-
-# ── Briefing helper ────────────────────────────────────────────────────────────
-
-def _gemini_headlines(n: int = 5) -> tuple[list[str], str]:
-    """
-    Fetches current headlines via Gemini grounded search.
-    Optimised for speed: minimal prompt + strict token cap.
-    Returns (headline_list, raw_text_for_display).
-    """
-    import re
-    from google import genai
-
-    client = genai.Client(api_key=_get_api_key())
-    response = client.models.generate_content(
-        model="gemini-flash-latest",
-        contents=f"Current world news: {n} headlines. Numbered list, titles only.",
-        config={"tools": [{"google_search": {}}]},
-    )
-
-    raw = ""
-    for part in response.candidates[0].content.parts:
-        if hasattr(part, "text") and part.text:
-            raw += part.text
-
-    headlines = []
-    for line in raw.strip().split("\n"):
-        line = line.strip()
-        if not line:
-            continue
-        # Only accept lines that begin with a number — skips preamble/closing sentences
-        if not re.match(r'^[\d]+[.\)\-]', line):
-            continue
-        clean = re.sub(r'^[\d]+[.\)\-]\s*', '', line)
-        clean = re.sub(r'^\*+\s*',          '', clean).strip()
-        if clean and len(clean) > 10:
-            headlines.append(clean)
-
-    return headlines[:n], raw.strip()
-
-
-# ── Modes ──────────────────────────────────────────────────────────────────────
-
-def _search(query: str) -> str:
-    """Default search — Gemini grounded, DDG fallback."""
     try:
-        return _gemini_search(query)
-    except Exception as e:
-        print(f"[WebSearch] ⚠️ Gemini failed ({e}) — trying DDG...")
-        results = _ddg_search(query)
-        return _format_ddg(query, results)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
+        r = requests.get(url, headers=headers, timeout=10)
+        r.raise_for_status()
+        html = r.text
 
-
-def _news(query: str) -> str:
-    """
-    Runs Gemini grounded search AND DDG news in parallel.
-    Returns whichever delivers a valid result first; cancels the other.
-    """
-    import threading
-
-    gemini_query = f"latest news today: {query}" if query else "top world news today"
-    ddg_query    = query if query else "world news today"
-
-    result_box  = [None]   # first valid result lands here
-    lock        = threading.Lock()
-    done_evt    = threading.Event()
-    failures    = [0]
-
-    def _store(r: str) -> None:
-        if r and len(r) > 60:
-            with lock:
-                if result_box[0] is None:
-                    result_box[0] = r
-            done_evt.set()
+        if BeautifulSoup:
+            soup = BeautifulSoup(html, "html.parser")
+            # Remove scripts and styles
+            for script in soup(["script", "style", "nav", "footer", "header", "aside"]):
+                script.decompose()
+            text = soup.get_text(separator="\n")
+            # Clean up whitespace
+            lines = [line.strip() for line in text.splitlines() if line.strip()]
+            text = "\n".join(lines)
         else:
-            with lock:
-                failures[0] += 1
-                if failures[0] >= 2:   # both failed — unblock caller
-                    done_evt.set()
+            # Extremely basic fallback
+            text = re.sub(r'<[^>]+>', ' ', html)
+            text = re.sub(r'\s+', ' ', text).strip()
 
-    def _try_gemini():
-        try:
-            _store(_gemini_search(gemini_query))
-        except Exception as e:
-            print(f"[WebSearch] ⚠️ Gemini news failed ({e})")
-            _store("")
+        # Limit text to avoid blowing up context window (about 8000 chars)
+        max_chars = 8000
+        truncated = False
+        if len(text) > max_chars:
+            text = text[:max_chars] + "... [TRUNCATED]"
+            truncated = True
 
-    def _try_ddg():
-        try:
-            results = _ddg_news(ddg_query, max_results=8)
-            _store(_format_news(ddg_query, results))
-        except Exception as e:
-            print(f"[WebSearch] ⚠️ DDG news failed ({e})")
-            _store("")
+        return {
+            "action": "read_page",
+            "url": url,
+            "content": text,
+            "truncated": truncated
+        }
 
-    threading.Thread(target=_try_gemini, daemon=True).start()
-    threading.Thread(target=_try_ddg,    daemon=True).start()
+    except Exception as e:
+        return {"error": f"Failed to read page: {e}", "url": url}
 
-    done_evt.wait(timeout=10.0)
-    return result_box[0] or f"No news found for: {query}"
+def op_open_url(url: str) -> dict:
+    """Opens a URL in the user's native default browser."""
+    import webbrowser
+    if not url.startswith("http"):
+        url = "https://" + url
+
+    try:
+        success = webbrowser.open(url)
+        if success:
+            return {"action": "open_url", "url": url, "status": "Opened natively in default browser."}
+        else:
+            return {"error": "Failed to open browser."}
+    except Exception as e:
+        return {"error": f"Error opening URL: {e}"}
 
 
-def _research(query: str) -> str:
+# ── Dispatcher ───────────────────────────────────────────────────────────────
+
+def web_search(parameters: dict, player=None, **kwargs) -> Any:
     """
-    Deep dive — asks Gemini for a comprehensive answer with context.
-    Falls back to a wider DDG fetch.
+    Main entry point for web research and navigation.
+    Returns structured dicts so they go into operational context.
     """
-    research_query = (
-        f"Comprehensive, detailed explanation of: {query}. "
-        "Include background context, key facts, current state, and important nuances."
-    )
-    try:
-        return _gemini_search(research_query)
-    except Exception as e:
-        print(f"[WebSearch] ⚠️ Research Gemini failed ({e}) — DDG fallback...")
-        results = _ddg_search(query, max_results=10)
-        return _format_ddg(query, results)
-
-
-def _price(query: str) -> str:
-    """Product price lookup — searches for current market prices."""
-    price_query = f"current price of {query} — how much does it cost today"
-    try:
-        return _gemini_search(price_query)
-    except Exception as e:
-        print(f"[WebSearch] ⚠️ Price Gemini failed ({e}) — DDG fallback...")
-        results = _ddg_search(f"{query} price buy", max_results=6)
-        return _format_ddg(query, results)
-
-
-def _compare(items: list[str], aspect: str) -> str:
-    query = (
-        f"Compare {', '.join(items)} in terms of {aspect}. "
-        "Give specific facts and data."
-    )
-    try:
-        return _gemini_search(query)
-    except Exception as e:
-        print(f"[WebSearch] ⚠️ Gemini compare failed: {e} — falling back to DDG")
-
-    all_results: dict[str, list] = {}
-    for item in items:
-        try:
-            all_results[item] = _ddg_search(f"{item} {aspect}", max_results=3)
-        except Exception:
-            all_results[item] = []
-
-    lines = [f"Comparison — {aspect.upper()}", "─" * 40]
-    for item in items:
-        lines.append(f"\n▸ {item}")
-        for r in all_results.get(item, [])[:2]:
-            if r.get("snippet"):
-                lines.append(f"  • {r['snippet']}")
-            if r.get("url"):
-                lines.append(f"    {r['url']}")
-    return "\n".join(lines)
-
-
-# ── Public entry point ─────────────────────────────────────────────────────────
-
-def web_search(
-    parameters:     dict,
-    response=None,
-    player=None,
-    session_memory=None,
-) -> str:
     params = parameters or {}
+    action = params.get("action", "search").lower().strip()
     query  = params.get("query", "").strip()
-    mode   = params.get("mode",  "search").lower().strip()
-    items  = params.get("items", [])
-    aspect = params.get("aspect", "general").strip() or "general"
+    domain = params.get("domain", "").strip()
+    url    = params.get("url", "").strip()
 
-    if not query and not items:
-        return "Please provide a search query."
-
-    if items and mode not in ("compare",):
-        mode = "compare"
+    # Backwards compatibility: if action is missing but query is present, it's a search.
+    # Also support older modes (research, price, compare) by falling back to search.
+    if action in ("research", "price", "compare"):
+        action = "search"
 
     if player:
-        player.write_log(f"[Search:{mode}] {query or ', '.join(items)}")
+        player.write_log(f"[WebResearch] {action}: {query or url}")
+    print(f"[WebResearch] 🔍 action={action!r} query={query!r} domain={domain!r} url={url!r}")
 
-    print(f"[WebSearch] 🔍 mode={mode!r}  query={query!r}")
+    if action == "search":
+        if not query:
+            return {"error": "Query is required for search action"}
+        return op_search(query, domain=domain)
 
-    try:
-        if mode == "compare" and items:
-            return _compare(items, aspect)
-        if mode == "news":
-            return _news(query)
-        if mode == "research":
-            return _research(query)
-        if mode == "price":
-            return _price(query)
-        return _search(query)
+    elif action == "news":
+        if not query:
+            return {"error": "Query is required for news action"}
+        return op_news(query, domain=domain)
 
-    except Exception as e:
-        print(f"[WebSearch] ❌ All backends failed: {e}")
-        return f"Search failed: {e}"
+    elif action == "read_page":
+        if not url:
+            return {"error": "URL is required for read_page action"}
+        return op_read_page(url)
+
+    elif action == "open_url":
+        if not url:
+            return {"error": "URL is required for open_url action"}
+        return op_open_url(url)
+
+    else:
+        return {"error": f"Unknown action: {action}"}
 
 
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "web_search",
-    "description": "Searches the web. Use for ANY question about current facts, events, prices, or topics — always prefer this over guessing. Modes: 'search' (default), 'news' (latest headlines on a topic), 'research' (deep comprehensive answer), 'price' (product cost lookup), 'compare' (side-by-side comparison of items).",
+    "description": (
+        "Semantic Web Research and Source Navigation tool. "
+        "Allows you to search the web, read specific pages, and open URLs. "
+        "Use 'search' to get structured results (optionally restricted to a domain like 'wikipedia.org' or 'youtube.com'). "
+        "Use 'read_page' to extract text from a specific URL. "
+        "Use 'open_url' to visually open a site/video for the user in their native browser."
+    ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
+            "action": {
+                "type": "STRING",
+                "description": "search | news | read_page | open_url"
+            },
             "query": {
                 "type": "STRING",
-                "description": "Search query or topic"
+                "description": "Search query or topic (required for search/news)"
             },
-            "mode": {
+            "domain": {
                 "type": "STRING",
-                "description": "search | news | research | price | compare"
+                "description": "Optional: Restrict search to a specific domain/source (e.g., 'wikipedia.org', 'youtube.com')"
             },
-            "items": {
-                "type": "ARRAY",
-                "items": {
-                    "type": "STRING"
-                },
-                "description": "Items to compare (compare mode)"
-            },
-            "aspect": {
+            "url": {
                 "type": "STRING",
-                "description": "Comparison aspect: price | specs | reviews | features"
+                "description": "Target URL (required for read_page/open_url)"
             }
         },
         "required": [
-            "query"
+            "action"
         ]
     },
     "handler": web_search,

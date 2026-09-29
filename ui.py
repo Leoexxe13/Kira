@@ -1922,6 +1922,175 @@ class PluginManagerOverlay(QWidget):
         self._style_toggle(btn, new_val)
 
 
+
+
+class CapabilitiesOverlay(QWidget):
+    """Floating overlay - Centro de Capacidades showing all available tools."""
+    _OW = 500
+
+    def __init__(self, capabilities: list[dict], submit_callback, parent=None):
+        super().__init__(parent)
+        self._capabilities = capabilities
+        self._submit_callback = submit_callback
+        
+        self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
+        self.setStyleSheet(f"""
+            CapabilitiesOverlay {{
+                background: rgba(0, 6, 10, 245);
+                border: 1px solid {C.BORDER_B};
+                border-radius: 6px;
+            }}
+        """)
+        self.setFixedWidth(self._OW)
+
+        main_lay = QVBoxLayout(self)
+        main_lay.setContentsMargins(20, 16, 20, 16)
+        main_lay.setSpacing(6)
+
+        hdr = QLabel("⚡ CENTRO DE CAPACIDADES")
+        hdr.setFont(QFont("Courier New", 12, QFont.Weight.Bold))
+        hdr.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+        main_lay.addWidget(hdr)
+        
+        self.search_input = QLineEdit()
+        self.search_input.setPlaceholderText("Buscar capacidad...")
+        self.search_input.setFont(QFont("Courier New", 9))
+        self.search_input.setStyleSheet(f"""
+            QLineEdit {{
+                background: #00111a; color: {C.TEXT};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+                padding: 4px;
+            }}
+            QLineEdit:focus {{ border: 1px solid {C.PRI}; }}
+        """)
+        self.search_input.textChanged.connect(self._filter_list)
+        main_lay.addWidget(self.search_input)
+        
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.HLine)
+        sep.setStyleSheet(f"color: {C.BORDER}; margin: 2px 0;")
+        main_lay.addWidget(sep)
+
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setStyleSheet("background: transparent; border: none;")
+        
+        self.scroll_content = QWidget()
+        self.scroll_content.setStyleSheet("background: transparent;")
+        self.list_lay = QVBoxLayout(self.scroll_content)
+        self.list_lay.setContentsMargins(0, 0, 0, 0)
+        self.list_lay.setSpacing(10)
+        
+        self.scroll.setWidget(self.scroll_content)
+        main_lay.addWidget(self.scroll, stretch=1)
+        
+        self.setFixedHeight(500) # Max height
+        
+        self.rows = []
+        for cap in self._capabilities:
+            self._build_row(cap)
+            
+        main_lay.addSpacing(4)
+        close_btn = QPushButton("CERRAR")
+        close_btn.setFixedHeight(30)
+        close_btn.setFont(QFont("Courier New", 9))
+        close_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: transparent; color: {C.TEXT_MED};
+                border: 1px solid {C.BORDER}; border-radius: 3px;
+            }}
+            QPushButton:hover {{ color: {C.TEXT}; border-color: {C.BORDER_B}; }}
+        """)
+        close_btn.clicked.connect(self.hide)
+        main_lay.addWidget(close_btn)
+
+    def _build_row(self, cap: dict):
+        container = QWidget()
+        lay = QVBoxLayout(container)
+        lay.setContentsMargins(0,0,0,0)
+        lay.setSpacing(2)
+        
+        name = cap.get("name", "unknown")
+        desc = cap.get("description", "Sin descripción")
+        params = cap.get("parameters", {}).get("properties", {})
+        req = cap.get("parameters", {}).get("required", [])
+        
+        name_lbl = QLabel(name)
+        name_lbl.setFont(QFont("Courier New", 10, QFont.Weight.Bold))
+        name_lbl.setStyleSheet(f"color: {C.TEXT}; background: transparent;")
+        lay.addWidget(name_lbl)
+        
+        desc_lbl = QLabel(desc)
+        desc_lbl.setFont(QFont("Courier New", 8))
+        desc_lbl.setStyleSheet(f"color: {C.TEXT_DIM}; background: transparent;")
+        desc_lbl.setWordWrap(True)
+        lay.addWidget(desc_lbl)
+        
+        if params:
+            param_str = "Parámetros obligatorios: " + (", ".join(req) if req else "Ninguno")
+            p_lbl = QLabel(param_str)
+            p_lbl.setFont(QFont("Courier New", 8))
+            p_lbl.setStyleSheet(f"color: {C.PRI}; background: transparent;")
+            lay.addWidget(p_lbl)
+            
+        btn_lay = QHBoxLayout()
+        btn_lay.setContentsMargins(0, 4, 0, 0)
+        
+        use_btn = QPushButton("Usar")
+        use_btn.setFixedHeight(24)
+        use_btn.setFont(QFont("Courier New", 8))
+        use_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        use_btn.setStyleSheet(f"""
+            QPushButton {{ background: #001a08; color: {C.GREEN}; border: 1px solid {C.GREEN_D}; border-radius: 3px; }}
+            QPushButton:hover {{ background: #002010; }}
+        """)
+        use_btn.clicked.connect(lambda _, n=name, r=req: self._use_capability(n, r))
+        
+        test_btn = QPushButton("Probar")
+        test_btn.setFixedHeight(24)
+        test_btn.setFont(QFont("Courier New", 8))
+        test_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        test_btn.setStyleSheet(f"""
+            QPushButton {{ background: transparent; color: {C.PRI}; border: 1px solid {C.PRI}; border-radius: 3px; }}
+            QPushButton:hover {{ background: rgba(0,255,255,20); }}
+        """)
+        test_btn.clicked.connect(lambda _, n=name: self._test_capability(n))
+        
+        btn_lay.addWidget(use_btn)
+        btn_lay.addWidget(test_btn)
+        btn_lay.addStretch()
+        
+        lay.addLayout(btn_lay)
+        
+        self.list_lay.addWidget(container)
+        self.rows.append((container, name.lower(), desc.lower()))
+
+    def _filter_list(self, text):
+        q = text.lower()
+        for container, name, desc in self.rows:
+            container.setVisible(q in name or q in desc)
+
+    def _use_capability(self, name, required):
+        # Guided flow for required parameters only
+        params_str = ""
+        if required:
+            # Simple dialog to collect them
+            from PyQt6.QtWidgets import QInputDialog
+            vals = []
+            for r in required:
+                val, ok = QInputDialog.getText(self, f"Usar {name}", f"Introduce parámetro obligatorio '{r}':")
+                if not ok: return # User cancelled
+                vals.append(f"{r}='{val}'")
+            params_str = " con " + ", ".join(vals)
+            
+        intent_cmd = f"Usa la capacidad {name}{params_str}"
+        self._submit_callback(intent_cmd)
+        self.hide()
+
+    def _test_capability(self, name):
+        intent_cmd = f"Prueba la capacidad {name} con valores seguros de demostración"
+        self._submit_callback(intent_cmd)
+        self.hide()
 class _HudOverlay(QWidget):
     """Base for the floating panels placed by hand over the HUD.
 
@@ -3041,6 +3210,10 @@ class KiraChatFeed(QScrollArea):
 class MainWindow(QMainWindow):
     _log_sig        = pyqtSignal(str)
     _state_sig      = pyqtSignal(str)
+    _progress_sig   = pyqtSignal(str)
+    _phone_conn_sig = pyqtSignal()
+    _append_input_sig = pyqtSignal(str)
+    _deliverable_sig = pyqtSignal(str, str, str) # title, desc, path
     _content_sig    = pyqtSignal(str, str)   # (title, text) — thread-safe content display
     _reconfig_sig   = pyqtSignal()           # trigger setup overlay from any thread
     _camera_sig     = pyqtSignal(bytes)      # show camera frame preview (small overlay)
@@ -3080,6 +3253,7 @@ class MainWindow(QMainWindow):
         self.on_text_command   = None
         self.on_remote_clicked = None   # callable: () -> (url, key) | None
         self.on_interrupt      = None   # callable: () -> None — stop JARVIS mid-speech
+        self.on_dictate_toggle = None   # callable: (bool) -> None — dictation mode
         self.on_voice_change   = None   # callable: () -> None — rebuild session with new voice
         self.on_audio_device_change = None  # callable: () -> None — reopen audio streams
         self._confirm_overlay  = None   # live ConfirmBanner, if one is on screen
@@ -3203,11 +3377,13 @@ class MainWindow(QMainWindow):
         _chat_layout.addWidget(_chat_title)
         _chat_layout.addWidget(self._right_panel, 1)
 
+        self._automations_page = self._build_real_automations_page()
         for _page in (
             self._home_page,
             self._system_page,
             self._kira_page,
             self._tasks_page,
+            self._automations_page,
             self._chat_page,
         ):
             self._workspace_stack.addWidget(_page)
@@ -3239,6 +3415,10 @@ class MainWindow(QMainWindow):
         self._log_sig.connect(self._home_activity.append)
         self._state_sig.connect(self._apply_state)
         self._state_sig.connect(self._mirror_kira_state)
+        self._progress_sig.connect(self._apply_progress)
+        self._phone_conn_sig.connect(self._do_notify_phone_connected)
+        self._append_input_sig.connect(self._do_append_input)
+        self._deliverable_sig.connect(self._add_deliverable_card)
         self._content_sig.connect(self._show_content)
         self._content_sig.connect(self._mirror_kira_content)
         self._reconfig_sig.connect(self._show_setup)
@@ -3862,6 +4042,68 @@ class MainWindow(QMainWindow):
                         pass
                 return True
         return False
+
+
+    def _build_real_automations_page(self) -> QWidget:
+        page = QWidget()
+        outer = QVBoxLayout(page)
+        outer.setContentsMargins(14, 12, 14, 12)
+        outer.setSpacing(10)
+
+        head = QHBoxLayout()
+        lbl = QLabel("AUTOMATIZACIONES")
+        lbl.setFont(QFont("Courier New", 11, QFont.Weight.Bold))
+        lbl.setStyleSheet(f"color: {C.PRI}; background: transparent; letter-spacing: 2px;")
+        head.addWidget(lbl)
+        head.addStretch()
+        
+        btn_refresh = QPushButton("REFRESH")
+        btn_refresh.setCursor(Qt.CursorShape.PointingHandCursor)
+        btn_refresh.setStyleSheet(f"color: {C.WHITE}; background: {C.PANEL2}; padding: 4px;")
+        btn_refresh.clicked.connect(self._refresh_automations_ui)
+        head.addWidget(btn_refresh)
+        outer.addLayout(head)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setStyleSheet("border:none; background:transparent;")
+        self._automations_container = QWidget()
+        self._automations_layout = QVBoxLayout(self._automations_container)
+        self._automations_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        scroll.setWidget(self._automations_container)
+        outer.addWidget(scroll, 1)
+
+        self._refresh_automations_ui()
+        return page
+
+    def _refresh_automations_ui(self):
+        while self._automations_layout.count():
+            item = self._automations_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        try:
+            import memory.scheduler_db as db
+            autos = db.get_all_automations()
+            if not autos:
+                empty = QLabel("No hay automatizaciones.")
+                self._automations_layout.addWidget(empty)
+                return
+            import datetime
+            for a in autos:
+                c = QWidget()
+                c.setStyleSheet(f"background: {C.PANEL}; border: 1px solid {C.BORDER};")
+                vl = QVBoxLayout(c)
+                title = QLabel(f"[{a['status'].upper()}] {a['title']}")
+                title.setStyleSheet(f"color: {C.WHITE}; font-weight: bold;")
+                vl.addWidget(title)
+                try: dt = datetime.datetime.fromtimestamp(a['next_run']).strftime('%Y-%m-%d %H:%M')
+                except: dt = "Unknown"
+                desc = QLabel(f"{a['schedule_type']} | Expr: {a['schedule_expr']} | Next: {dt}")
+                desc.setStyleSheet(f"color: {C.DIM};")
+                vl.addWidget(desc)
+                self._automations_layout.addWidget(c)
+        except Exception as e:
+            pass
 
     def _build_real_tasks_page(self) -> QWidget:
         page = QWidget()
@@ -4626,6 +4868,7 @@ class MainWindow(QMainWindow):
         add_btn("SISTEMA", "system")
         add_btn("JARVIS", "kira")
         add_btn("TAREAS", "tasks")
+        add_btn("AUTO", "automations")
         add_btn("CHAT", "chat")
         return bar
 
@@ -4635,7 +4878,8 @@ class MainWindow(QMainWindow):
             "system": 1,
             "kira": 2,
             "tasks": 3,
-            "chat": 4,
+            "automations": 4,
+            "chat": 5,
         }
 
         stack = getattr(self, "_workspace_stack", None)
@@ -5000,6 +5244,14 @@ class MainWindow(QMainWindow):
         plugin_btn.setStyleSheet(_BTN_STYLE_DIM)
         plugin_btn.clicked.connect(self._open_plugin_manager)
         lay.addWidget(plugin_btn)
+        cap_btn = QPushButton("⚡  CAPACIDADES")
+        cap_btn.setFixedHeight(26)
+        cap_btn.setFont(QFont("Courier New", 7))
+        cap_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        cap_btn.setStyleSheet(_BTN_STYLE_DIM)
+        cap_btn.clicked.connect(self._open_capabilities_center)
+        lay.addWidget(cap_btn)
+
 
         settings_btn = QPushButton("⚙  PLUGIN SETTINGS")
         settings_btn.setFixedHeight(26)
@@ -5045,6 +5297,21 @@ class MainWindow(QMainWindow):
         """)
         self._input.returnPressed.connect(self._send)
         row.addWidget(self._input)
+
+        self._dict_btn = QPushButton("🎤 DICTAR")
+        self._dict_btn.setFixedSize(92, 38)
+        self._dict_btn.setFont(QFont("Courier New", 9, QFont.Weight.Bold))
+        self._dict_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._dict_btn.setStyleSheet(f"""
+            QPushButton {{
+                background: {C.PANEL}; color: {C.PRI};
+                border: 1px solid {C.PRI_DIM}; border-radius: 3px;
+            }}
+            QPushButton:hover {{ background: {C.PRI_GHO}; border: 1px solid {C.PRI}; }}
+        """)
+        self._dict_btn.setCheckable(True)
+        self._dict_btn.clicked.connect(self._do_dictate_toggle)
+        row.addWidget(self._dict_btn)
 
         send = QPushButton("ENVIAR  ›")
         send.setFixedSize(92, 38)
@@ -5203,9 +5470,16 @@ class MainWindow(QMainWindow):
             )
             threading.Thread(target=self.on_text_command, args=(msg,), daemon=True).start()
 
-    def notify_phone_connected(self) -> None:
+    def _do_append_input(self, text: str):
+        current = self._input.text()
+        self._input.setText(current + " " + text if current else text)
+
+    def _do_notify_phone_connected(self) -> None:
         if self._remote_overlay and self._remote_overlay.isVisible():
             self._remote_overlay.mark_connected()
+
+    def notify_phone_connected(self) -> None:
+        self._phone_conn_sig.emit()
 
     def _open_remote(self):
         if not self.on_remote_clicked:
@@ -5604,6 +5878,25 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._log.append_log(f"ERR: Confirmation failed — {e}")
 
+    
+    def _open_capabilities_center(self):
+        caps = self.get_capabilities() if getattr(self, 'get_capabilities', None) else []
+        cw = self.centralWidget()
+        ov = CapabilitiesOverlay(caps, self._trigger_intent, parent=cw)
+        ov.adjustSize()
+        ov.setGeometry(
+            (cw.width()  - ov.width())  // 2,
+            (cw.height() - ov.height()) // 2,
+            ov.width(), ov.height(),
+        )
+        ov.show()
+        ov.raise_()
+        self._cap_center_overlay = ov
+
+    def _trigger_intent(self, text):
+        if hasattr(self, 'on_text_command') and self.on_text_command:
+            self.on_text_command(text)
+
     def _open_plugin_manager(self):
         plugins = self.get_plugins() if self.get_plugins else []
         cw = self.centralWidget()
@@ -5662,6 +5955,10 @@ class MainWindow(QMainWindow):
 
     # ────────────────────────────────────────────────────────────────────────────
 
+    def _do_dictate_toggle(self, checked):
+        if self.on_dictate_toggle:
+            self.on_dictate_toggle(checked)
+
     def _do_interrupt(self):
         if self.on_interrupt:
             self.on_interrupt()
@@ -5715,6 +6012,50 @@ class MainWindow(QMainWindow):
     def _apply_state(self, state: str):
         self.hud.state    = state
         self.hud.speaking = (state == "SPEAKING")
+
+    def _apply_progress(self, text: str):
+        self._kira_context_badge.setText("PROGRESO")
+        self._kira_context_text.setText(f"● {text}")
+
+    def _add_deliverable_card(self, title: str, desc: str, path: str):
+        import time, os
+        ts = time.strftime("%H:%M")
+        dir_path = os.path.dirname(path) if path else ""
+        html = f'''
+        <div style="margin:8px 0; max-width:420px; border:1px solid #333; border-radius:12px; background:#181818; overflow:hidden; font-family:'Helvetica Neue', Arial, Helvetica;">
+            <div style="background:#222; padding:8px 12px; border-bottom:1px solid #333; display:flex; justify-content:space-between; align-items:center;">
+                <span style="color:#FFF; font-weight:bold; font-size:12px; letter-spacing:0.5px;">✓ ENTREGABLE</span>
+                <span style="color:#777; font-size:10px;">{ts}</span>
+            </div>
+            <div style="padding:12px;">
+                <div style="color:#00E5FF; font-size:14px; font-weight:600; margin-bottom:4px;">{title}</div>
+                <div style="color:#AAA; font-size:12px; margin-bottom:8px;">{desc}</div>
+                <div style="color:#555; font-size:10px; font-family:monospace; background:#000; padding:6px; border-radius:4px; word-break:break-all; margin-bottom:10px;">{path}</div>
+                <div style="font-size:11px; font-weight:bold;">
+                    <a href="file://{path}" style="color:#00E5FF; text-decoration:none; margin-right:12px;">[ABRIR]</a>
+                    <a href="file://{dir_path}" style="color:#00E5FF; text-decoration:none;">[VER EN FINDER]</a>
+                </div>
+            </div>
+        </div>
+        '''
+        # Insert as HTML widget into the chat log feed
+        from PyQt6.QtWidgets import QLabel, QWidget, QHBoxLayout
+        from PyQt6.QtCore import Qt, QTimer
+        row = QWidget()
+        row.setStyleSheet('background:transparent;')
+        h = QHBoxLayout(row)
+        h.setContentsMargins(0,0,0,0)
+        
+        lbl = QLabel(html)
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lbl.setOpenExternalLinks(True)
+        h.addWidget(lbl)
+        h.addStretch(1)
+        
+        self._log._lay.insertWidget(self._log._lay.count()-1, row)
+        QTimer.singleShot(0, lambda: self._log.verticalScrollBar().setValue(self._log.verticalScrollBar().maximum()))
+        
+        self._log_sig.emit(f"[Deliverable] {title} -> {path}")
 
     def _check_config(self) -> bool:
         if not API_FILE.exists(): return False
@@ -5807,6 +6148,14 @@ class JarvisUI:
         self._win.on_interrupt = cb
 
     @property
+    def on_dictate_toggle(self):
+        return self._win.on_dictate_toggle
+
+    @on_dictate_toggle.setter
+    def on_dictate_toggle(self, cb):
+        self._win.on_dictate_toggle = cb
+
+    @property
     def on_voice_change(self):
         return self._win.on_voice_change
 
@@ -5889,6 +6238,9 @@ class JarvisUI:
     def write_log(self, text: str):
         self._win._log_sig.emit(text)
 
+    def append_input_text(self, text: str):
+        self._win._append_input_sig.emit(text)
+
     def wait_for_api_key(self):
         while not self._win._ready:
             time.sleep(0.1)
@@ -5896,6 +6248,14 @@ class JarvisUI:
     def show_content(self, title: str, text: str):
         """Thread-safe: display content in the panel below the HUD."""
         self._win._content_sig.emit(title[:48], text[:4000])
+
+    def show_progress(self, text: str):
+        """Thread-safe: emit a progress status update."""
+        self._win._progress_sig.emit(text)
+
+    def show_deliverable(self, title: str, desc: str, path: str):
+        """Thread-safe: display a deliverable card."""
+        self._win._deliverable_sig.emit(title, desc, path)
 
     def prompt_reconfig(self):
         """Thread-safe: show the API key setup overlay (e.g. after an auth error)."""

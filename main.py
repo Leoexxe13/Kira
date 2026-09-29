@@ -73,7 +73,6 @@ from actions.proactive         import ProactiveEngine
 from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
-from actions.web_search        import _news as _fetch_news_sync
 from memory.config_manager     import (
     get_brief_enabled, get_voice, get_wake_word_enabled, save_wake_word_enabled,    get_input_device, get_output_device,
 )
@@ -182,6 +181,7 @@ TOOL_DECLARATIONS = [
             "type": "OBJECT",
             "properties": {
                 "angle": {"type": "STRING", "description": "'screen' to capture display, 'camera' for webcam. Default: 'screen'"},
+                "window_name": {"type": "STRING", "description": "Optional. Specific app window to bring to front and capture on Mac (e.g., 'Safari', 'Pages')."},
                 "text":  {"type": "STRING", "description": "The question or instruction about the captured image"}
             },
             "required": ["text"]
@@ -243,10 +243,13 @@ TOOL_DECLARATIONS = [
         "name": "save_memory",
         "description": (
             "Save an important personal fact about the user to long-term memory. "
-            "Call this silently whenever the user reveals something worth remembering: "
+            "Call this silently whenever the user reveals something useful and durable: "
             "name, age, city, job, preferences, hobbies, relationships, projects, or future plans. "
-            "Do NOT call for: weather, reminders, searches, or one-time commands. "
-            "Do NOT announce that you are saving — just call it silently. "
+            "CRITICAL RULES: "
+            "1. Do NOT save passwords, tokens, credentials, or secrets. "
+            "2. Do NOT save greetings, questions, casual conversation, or temporary info (e.g. 'I am tired today'). "
+            "3. If a fact is already known, ONLY call this to update it if the user provides clearly new information. Avoid duplicates. "
+            "4. Do NOT announce that you are saving the memory. Keep the conversation flowing naturally. "
             "Values must be in English regardless of the conversation language."
         ),
         "parameters": {
@@ -260,13 +263,29 @@ TOOL_DECLARATIONS = [
                         "projects — active projects, goals, things being built | "
                         "relationships — friends, family, partner, colleagues | "
                         "wishes — future plans, things to buy, travel dreams | "
-                        "notes — habits, schedule, anything else worth remembering"
+                        "notes — habits, schedule, anything else durable"
                     )
                 },
-                "key":   {"type": "STRING", "description": "Short snake_case key (e.g. name, favorite_food, sister_name)"},
+                "key":   {"type": "STRING", "description": "Short snake_case key (e.g. name, favorite_food, brother_name). Try to match existing keys."},
                 "value": {"type": "STRING", "description": "Concise value in English (e.g. Fatih, pizza, older sister)"},
             },
             "required": ["category", "key", "value"]
+        }
+    },
+    {
+        "name": "forget_memory",
+        "description": (
+            "Delete a stored fact from long-term memory. "
+            "Call this silently when the user says 'forget that', 'I don't like that anymore', "
+            "or explicitly asks you to delete/forget a specific memory."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "category": {"type": "STRING", "description": "The category of the fact to forget (e.g. preferences, notes)."},
+                "key":      {"type": "STRING", "description": "The specific snake_case key to forget (e.g. favorite_food)."},
+            },
+            "required": ["category", "key"]
         }
     },
     {
@@ -389,9 +408,16 @@ class JarvisLive:
         self._interrupted          = False   # True while draining audio after user interrupt
         self.ui.on_text_command   = self._route_text_command_v1
         self.ui.on_remote_clicked = self._make_remote_key
-        self.ui.on_interrupt      = self.interrupt
+        self.ui.on_interrupt      = self.cancel_current_response
+        self.ui.on_dictate_toggle = self._toggle_dictation
         self.ui.on_voice_change   = self._on_voice_change     # voice picker → rebuild session
         self.ui.on_audio_device_change = self._on_audio_device_change
+
+        from core.scheduler import KiraScheduler
+        self.scheduler = KiraScheduler(
+            action_registry=None,  # Will be set when action_registry is initialized
+            ui_notify=self._scheduler_notify
+        )
         self._reconnect_event: asyncio.Event | None = None
         self._reconnect_keep = True   # False → next rebuild drops the resumption handle
 
@@ -417,6 +443,8 @@ class JarvisLive:
         self._proactive        = ProactiveEngine()
         self._last_user_speech = time.monotonic()  # updated on every user utterance
         self._session_log: list[str] = []          # conversation turns for end-of-session summary
+        self._tool_call_count = 0
+        self._last_tool_call = None
 
         self._enhanced_live = True  # proactive audio; auto-disabled if the server rejects it
 
@@ -442,6 +470,11 @@ class JarvisLive:
         self.ui.get_plugins = self._plugin_registry.list_for_ui
         self.ui.get_plugin_settings = self._plugin_registry.settings_schemas  # ⚙ settings tab
         self.ui.request_say = self.plugin_say   # plugins: mid-task speech channel
+        self.ui.get_capabilities = lambda: (
+            TOOL_DECLARATIONS
+            + self._action_registry.get_tool_declarations()
+            + self._plugin_registry.get_tool_declarations()
+        )
 
         # ── Wake word ────────────────────────────────────────────────────────
         # _awake gates the mic (see _listen_audio) and the background speakers.
@@ -934,6 +967,8 @@ class JarvisLive:
             self.ui.write_log("ERR: voz // Gemini tardó y Edge no pudo reproducir")
 
     def _on_text_command(self, text: str):
+        self._tool_call_count = 0
+        self._last_tool_call = None
         # KIRA_FAST_FEEDBACK_V4
         try:
             _q = str(text).lower()
@@ -968,6 +1003,11 @@ class JarvisLive:
             except Exception as e:
                 print(f"[Memory Context] FTS5 retrieval failed: {e}")
 
+        # Inject Operational Context
+        if hasattr(self, '_op_context') and self._op_context:
+            op_ctx_str = "\n".join(list(self._op_context))
+            final_text += f"\n\n[OPERATIONAL CONTEXT]\n{op_ctx_str}\n[/OPERATIONAL CONTEXT]"
+
         self._schedule_coro(
             self.session.send_client_content(
                 turns={"role": "user", "parts": [{"text": final_text}]},
@@ -988,31 +1028,85 @@ class JarvisLive:
         elif not self.ui.muted:
             self.ui.set_state("LISTENING")
 
-    def interrupt(self) -> None:
-        """Stop JARVIS mid-speech: drain queued audio and open mic immediately."""
+    def cancel_current_response(self) -> None:
+        """Detiene inmediatamente la respuesta actual, limpia buffers y cancela TTS."""
+        q = getattr(self, 'audio_in_queue', None)
+        if not getattr(self, '_is_speaking', False) and (not q or not q.qsize()):
+            # If not doing anything, nothing to cancel, but we still ensure we set interrupted
+            pass
+
         self._interrupted = True
-        # KIRA_V63_STOP_EDGE
+        
+        # Stop Edge TTS fallback if active
         try:
             _vm = getattr(self, '_kira_voice_manager_v63', None)
             if _vm is not None:
                 _vm.stop_now()
         except Exception:
             pass
+            
+        # Drain queued incoming audio from Gemini
         q = self.audio_in_queue
+        drained = 0
         if q:
-            drained = 0
             while True:
                 try:
                     q.get_nowait()
                     drained += 1
                 except Exception:
                     break
-            if drained:
-                print(f"[JARVIS] ✋ Interrupted — {drained} audio chunks discarded")
+        
+        # Cancel current hardware playback
+        try:
+            self._audio_pipeline.playback.stop("gemini")
+        except Exception:
+            pass
+            
+        if drained:
+            print(f"[JARVIS] ✋ Interrupted — {drained} audio chunks discarded")
+            
         self.set_speaking(False)
         if self._turn_done_event:
             self._turn_done_event.clear()
-        self.ui.write_log("SYS: Interrupted — listening...")
+            
+        self.ui.write_log("SYS: Interrumpido — escuchando...")
+
+
+    def _toggle_dictation(self, enabled: bool):
+        self._dictation_mode = enabled
+        if enabled:
+            self._dictation_buffer = bytearray()
+            self.ui.write_log("SYS: Modo Dictado ACTIVADO (Habla para transcribir)")
+        else:
+            self._dictation_buffer = bytearray()
+            self.ui.write_log("SYS: Modo Dictado DESACTIVADO")
+            
+    async def _process_dictation(self, audio_data: bytes):
+        try:
+            import google.genai as _genai
+            from google.genai import types
+            client = _genai.Client(api_key=_get_api_key())
+            cfg = dict(
+                system_instruction="Only transcribe the audio exactly. Do not respond to it. Respond in text only.",
+                response_modalities=["TEXT"],
+                input_audio_transcription={"model": "models/gemini-3.1-flash-live-preview"},
+            )
+            async with client.aio.live.connect(model=LIVE_MODEL, config=cfg) as session:
+                await session.send_realtime_input(audio=types.Blob(data=audio_data, mime_type="audio/pcm;rate=16000"))
+                await session.send_realtime_input(audio_stream_end=True)
+                
+                async for response in session.receive():
+                    sc = response.server_content
+                    if sc:
+                        if sc.input_transcription and sc.input_transcription.text:
+                            text = sc.input_transcription.text.strip()
+                            if text:
+                                self.ui.append_input_text(text)
+                                return # Early exit! We only care about transcription
+                        if sc.turn_complete:
+                            break
+        except Exception as e:
+            self.ui.write_log(f"ERR: Dictado falló - {e}")
 
     def speak(self, text: str):
         if not self._loop or not self.session:
@@ -1029,6 +1123,34 @@ class JarvisLive:
         short = str(error)[:120]
         self.ui.write_log(f"ERR: {tool_name} — {short}")
         self.speak(f"Sir, {tool_name} encountered an error. {short}")
+
+    def _build_capabilities_registry(self) -> str:
+        lines = ["[REGISTRO SEMÁNTICO DINÁMICO DE CAPACIDADES]",
+                 "Las siguientes herramientas están disponibles. Úsalas basándote en la intención del usuario y la descripción semántica de cada una, sin esperar frases exactas:"]
+        
+        all_decls = (
+            TOOL_DECLARATIONS
+            + self._action_registry.get_tool_declarations()
+            + self._plugin_registry.get_tool_declarations()
+        )
+        for d in all_decls:
+            name = d.get("name", "unknown")
+            desc = d.get("description", "Sin descripción")
+            lines.append(f"\n### Tool: {name}")
+            lines.append(f"Descripción: {desc}")
+            params = d.get("parameters", {})
+            props = params.get("properties", {})
+            req = params.get("required", [])
+            if props:
+                lines.append("Parámetros:")
+                for p_name, p_def in props.items():
+                    req_mark = "OBLIGATORIO" if p_name in req else "OPCIONAL"
+                    p_desc = p_def.get("description", "")
+                    lines.append(f"  - {p_name} ({p_def.get('type', 'STRING')}) [{req_mark}]: {p_desc}")
+            else:
+                lines.append("Parámetros: Ninguno")
+        lines.append("[/REGISTRO SEMÁNTICO DINÁMICO DE CAPACIDADES]")
+        return "\n".join(lines)
 
     def _build_config(self) -> types.LiveConnectConfig:
         from datetime import datetime
@@ -1072,11 +1194,27 @@ class JarvisLive:
             f"{_addr}\n\n"
         )
 
-        parts = [time_ctx, identity_ctx]
+        capabilities_ctx = self._build_capabilities_registry()
+
+        import os, platform
+        env_ctx = (
+            f"[SYSTEM ENVIRONMENT]\n"
+            f"OS: {platform.system()} {platform.release()}\n"
+            f"Home Directory: {os.path.expanduser('~')}\n"
+            f"Always use absolute paths derived from the Home Directory when saving files (e.g., {os.path.expanduser('~')}/Desktop/...).\n\n"
+        )
+        
+        parts = [time_ctx, identity_ctx, env_ctx, capabilities_ctx]
         if mem_str:
             parts.append(mem_str)
+        voice_ctx = (
+            "[VOICE INTERACTION]\n"
+            "Tu respuesta hablada debe ser fluida, natural y humana. NUNCA verbalices URLs completas, markdown, código "
+            "ni formatos técnicos. Si debes entregar un enlace o código largo, usa texto y en voz di algo breve como "
+            "'Te he dejado el enlace' o 'Aquí tienes el código'.\n\n"
+        )
+        parts.append(voice_ctx)
         parts.append(sys_prompt)
-
         cfg = dict(
             response_modalities=["AUDIO"],
             output_audio_transcription={},
@@ -1128,8 +1266,28 @@ class JarvisLive:
             key      = args.get("key", "")
             value    = args.get("value", "")
             if key and value:
-                update_memory({category: {key: {"value": value}}})
-                print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
+                try:
+                    update_memory({category: {key: {"value": value}}})
+                    print(f"[Memory] 💾 save_memory: {category}/{key} = {value}")
+                except Exception as e:
+                    print(f"[Memory] ⚠️ save_memory error: {e}")
+            if not self.ui.muted:
+                self.ui.set_state("LISTENING")
+            return types.FunctionResponse(
+                id=fc.id, name=name,
+                response={"result": "ok", "silent": True}
+            )
+
+        if name == "forget_memory":
+            category = args.get("category", "notes")
+            key      = args.get("key", "")
+            if key:
+                try:
+                    from memory.memory_manager import forget_memory
+                    forget_memory(key, category)
+                    print(f"[Memory] 🗑️ forget_memory: {category}/{key}")
+                except Exception as e:
+                    print(f"[Memory] ⚠️ forget_memory error: {e}")
             if not self.ui.muted:
                 self.ui.set_state("LISTENING")
             return types.FunctionResponse(
@@ -1177,9 +1335,10 @@ class JarvisLive:
                         print(f"[Vision] 📷 Camera: {len(img_b):,} bytes")
                         _stall = "camera"
                     else:
-                        img_b, mime_t = await loop.run_in_executor(None, _capture_screen)
+                        window_name = args.get("window_name")
+                        img_b, mime_t = await loop.run_in_executor(None, _capture_screen, window_name)
                         print(f"[Vision] 🖥️  Screen: {len(img_b):,} bytes")
-                        _stall = "screen"
+                        _stall = f"screen ({window_name})" if window_name else "screen"
                     self._pending_vision = (img_b, mime_t, user_text, angle)
                     result = (
                         f"[VISION_ACTIVE] {_stall.capitalize()} captured. "
@@ -1241,8 +1400,57 @@ class JarvisLive:
                     args["file_path"] = self.ui.current_file
                 _ctx = {"player": self.ui, "speak": self.speak,
                         "response": None, "session_memory": None}
+                
+                # Emit progress update for GUI
+                action_desc = f"Operación: {name.replace('_', ' ')}"
+                if name == "web_search": action_desc = f"Investigando: {args.get('query', '')}"
+                elif name == "document_maker": action_desc = f"Construyendo: {args.get('title', 'documento')}"
+                elif name == "file_controller": action_desc = f"Accediendo archivos..."
+                elif name == "mac_orchestrator": action_desc = f"Controlando aplicación..."
+                self.ui.show_progress(action_desc)
+
                 r = await loop.run_in_executor(None, lambda: self._action_registry.run(name, args, _ctx))
                 result = r or "Done."
+                
+                # Parse events
+                if isinstance(result, str):
+                    if "DELIVERABLE_CREATED" in result:
+                        try:
+                            deliv = json.loads(result)
+                            if deliv.get("status") == "DELIVERABLE_CREATED":
+                                meta = deliv.get("metadata", {})
+                                meta_str = " | ".join(f"{k}: {v}" for k,v in meta.items()) if isinstance(meta, dict) else ""
+                                desc = f"Tipo: {deliv.get('type', '')}"
+                                if meta_str: desc += f" | {meta_str}"
+                                self.ui.show_deliverable(deliv.get("title", "Entregable"), desc, deliv.get("path", ""))
+                        except Exception:
+                            pass
+                    elif "VISUAL_QA_READY" in result:
+                        try:
+                            qa_data = json.loads(result)
+                            if qa_data.get("status") == "VISUAL_QA_READY":
+                                imgs = qa_data.get("images", [])
+                                if imgs:
+                                    import base64 as _b64, os
+                                    parts = []
+                                    for img_path in imgs[:10]: # Max 10 slides
+                                        with open(img_path, "rb") as f:
+                                            b = f.read()
+                                            mime = "image/jpeg" if img_path.lower().endswith(".jpg") or img_path.lower().endswith(".jpeg") else "image/png"
+                                            b64 = _b64.b64encode(b).decode("ascii")
+                                            parts.append({"inline_data": {"mime_type": mime, "data": b64}})
+                                        try:
+                                            os.remove(img_path)
+                                        except Exception: pass
+                                    # Try to remove the directory if empty
+                                    if imgs:
+                                        try: os.rmdir(os.path.dirname(imgs[0]))
+                                        except Exception: pass
+                                    parts.append({"text": "Aquí están los renders visuales del documento (Quality: PREMIUM). Realiza el VISUAL QA. Revisa overflow, texto cortado, contraste y jerarquía visual. Asigna un SCORE (0-100). Si detectas fallos que rompen la legibilidad, ajusta el Spec de las slides afectadas e inicia el Repair Loop (máx 2 ciclos). Si está perfecto, finaliza."})
+                                    self._pending_qa_parts = parts
+                        except Exception:
+                            pass
+                
                 # web_search: mirror results to the on-screen content panel
                 if (name == "web_search" and r
                         and not r.startswith("No results")
@@ -1265,7 +1473,8 @@ class JarvisLive:
         except Exception as e:
             result = f"Tool '{name}' failed: {e}"
             traceback.print_exc()
-            self.speak_error(name, e)
+            # Let Gemini handle the error via tool response to allow retry instead of immediately speaking an error
+            # self.speak_error(name, e)
 
         if not self.ui.muted:
             self.ui.set_state("LISTENING")
@@ -1276,9 +1485,25 @@ class JarvisLive:
             self._kira_last_tool_name = name
             self._kira_last_tool_result = str(result)
 
+        # Update Operational Context
+        if not hasattr(self, '_op_context'):
+            from collections import deque
+            self._op_context = deque(maxlen=5)
+
+        _res_str = str(result)
+        if name not in ("save_memory", "forget_memory") and _res_str and not _res_str.lower().startswith(("tool '", "error", "unknown tool", "failed")):
+            _summary = _res_str[:250].replace('\n', ' ')
+            _entry = f"Tool: {name} | Args: {dict(args or {})} | Result: {_summary}"
+            self._op_context.append(_entry)
+
+        _op_list = list(getattr(self, '_op_context', []))
+
         return types.FunctionResponse(
             id=fc.id, name=name,
-            response={"result": result}
+            response={
+                "result": result,
+                "operational_context": _op_list
+            }
         )
 
     async def _send_realtime(self):
@@ -1287,6 +1512,24 @@ class JarvisLive:
             msg = self._audio_pipeline.ready_to_send(await self.out_queue.get())
             if msg is None:
                 continue
+
+            # Modo Dictado
+            if getattr(self, '_dictation_mode', False):
+                self._dictation_buffer.extend(msg.data)
+                if msg.discontinuity and len(self._dictation_buffer) > 0:
+                    audio_to_transcribe = bytes(self._dictation_buffer)
+                    self._dictation_buffer.clear()
+                    self._dictation_mode = False # Desactiva después del turno dictado
+                    self.ui.on_dictate_toggle(False) # Toggle UI button off if possible, but UI might not have a setter
+                    self.ui.write_log("SYS: Transcribiendo dictado...")
+                    asyncio.create_task(self._process_dictation(audio_to_transcribe))
+                continue
+
+            # BARGE-IN: Si KIRA está hablando o reproduciendo, detener la respuesta actual
+            q = getattr(self, 'audio_in_queue', None)
+            if getattr(self, '_is_speaking', False) or (q and q.qsize() > 0):
+                self.cancel_current_response()
+
             if msg.discontinuity and sent_audio:
                 await self.session.send_realtime_input(audio_stream_end=True)
                 sent_audio = False
@@ -1414,6 +1657,7 @@ class JarvisLive:
                     if response.server_content:
                         sc = response.server_content
 
+                        # Use output transcription as the true source of KIRA's text
                         if sc.output_transcription and sc.output_transcription.text:
                             txt = _clean_transcript(sc.output_transcription.text)
                             if txt and txt != (out_buf[-1] if out_buf else ""):
@@ -1442,6 +1686,8 @@ class JarvisLive:
 
                             full_in = " ".join(in_buf).strip()
                             if full_in:
+                                self._tool_call_count = 0
+                                self._last_tool_call = None
                                 self.ui.write_log(f"You: {full_in}")
                                 self._session_log.append(f"User: {full_in}")
                                 if self._dashboard:
@@ -1485,7 +1731,16 @@ class JarvisLive:
                             out_buf = []
 
                             # Vision injection: model finished tool-response turn → now send the image
-                            if self._pending_vision and self.session:
+                            if getattr(self, "_pending_qa_parts", None) and self.session:
+                                parts = self._pending_qa_parts
+                                self._pending_qa_parts = None
+                                print(f"[QA] 📤 Injecting {len(parts)-1} images for Visual QA → main session")
+                                await self.session.send_client_content(
+                                    turns={"role": "user", "parts": parts},
+                                    turn_complete=True,
+                                )
+
+                            elif self._pending_vision and self.session:
                                 import base64 as _b64
                                 img_b, mime_t, question, angle = self._pending_vision
                                 self._pending_vision = None
@@ -1516,8 +1771,38 @@ class JarvisLive:
                                 asyncio.create_task(_cam_close())
 
                     if response.tool_call:
+                        if self._interrupted:
+                            fn_responses = []
+                            for fc in response.tool_call.function_calls:
+                                fn_responses.append(types.FunctionResponse(
+                                    id=fc.id, name=fc.name,
+                                    response={"result": "Cancelled: The user interrupted you and started speaking."}
+                                ))
+                            await self.session.send_tool_response(function_responses=fn_responses)
+                            continue
+
+                        self._tool_call_count += 1
+                        if self._tool_call_count > 5:
+                            fn_responses = []
+                            for fc in response.tool_call.function_calls:
+                                fn_responses.append(types.FunctionResponse(
+                                    id=fc.id, name=fc.name,
+                                    response={"result": "Error: Maximum tool execution limit (5) reached for this turn."}
+                                ))
+                            await self.session.send_tool_response(function_responses=fn_responses)
+                            continue
+
                         fn_responses = []
                         for fc in response.tool_call.function_calls:
+                            call_sig = (fc.name, str(dict(fc.args or {})))
+                            if call_sig == self._last_tool_call:
+                                fn_responses.append(types.FunctionResponse(
+                                    id=fc.id, name=fc.name,
+                                    response={"result": "Error: You just called this tool with the exact same arguments. Please try a different approach."}
+                                ))
+                                continue
+                            self._last_tool_call = call_sig
+
                             print(f"[JARVIS] 📞 {fc.name}")
                             fr = await self._execute_tool(fc)
                             fn_responses.append(fr)
@@ -2009,6 +2294,19 @@ class JarvisLive:
 
     # ── main loop ───────────────────────────────────────────────────────────
 
+
+    def _scheduler_notify(self, action, payload):
+        if action == "BACKGROUND_GOAL_START":
+            # Start background goal without blocking
+            title = payload.get("title", "Goal")
+            prompt = payload.get("prompt", "")
+            self.ui.write_log(f"⚙️ Iniciando trabajo en background: {title}")
+            # Inject to main queue directly
+            if self.audio_in_queue:
+                import sys
+                self.ui.show_progress(f"Goal: {title}", "Procesando background...")
+                self._loop.call_soon_threadsafe(self.audio_in_queue.put_nowait, prompt)
+
     async def run(self):
         self._loop = asyncio.get_event_loop()
         self._reconnect_event = asyncio.Event()
@@ -2028,6 +2326,10 @@ class JarvisLive:
         # constants that actually open them — so it can never list a device that
         # cannot be opened at them.
         audio_devices.configure(SEND_SAMPLE_RATE, RECEIVE_SAMPLE_RATE)
+        
+        # Give scheduler access to action_registry and start it
+        self.scheduler.action_registry = getattr(self, "_action_registry", None)
+        asyncio.create_task(self.scheduler.run_loop())
 
         # Enumerate audio devices off-thread. The settings drawer must never pay
         # for host-API enumeration on the Qt thread.

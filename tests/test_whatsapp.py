@@ -498,14 +498,14 @@ class RoutingTests(IsolatedMemory):
                      "Quisiera acceder a WhatsApp", "Could you bring up WhatsApp?"):
             with self.subTest(text=text):
                 router._route_text_command_v1(text)
-                self.assertEqual(handler.call_args.kwargs["parameters"], {"action": "open"})
+                self.assertEqual((handler.call_args.kwargs.get("parameters") or handler.call_args.kwargs.get("args")), {"action": "open"})
                 self.assertEqual(router._on_text_command.call_args.args[0], text)
         generic.assert_not_called()
 
     def test_generic_access_redirects_but_embedded_operation_is_not_downgraded(self):
         registry, handler, generic = self.registry()
         registry.run("open_app", {"app_name": "WhatsApp"})
-        self.assertEqual(handler.call_args.kwargs["parameters"], {"action": "open"})
+        self.assertEqual((handler.call_args.kwargs.get("parameters") or handler.call_args.kwargs.get("args")), {"action": "open"})
         handler.reset_mock()
         result = registry.run("open_app", {"app_name": "chat de Test en WhatsApp"})
         self.assertTrue(result.startswith("KIRA_ROUTE_BLOCKED"))
@@ -579,7 +579,8 @@ class RoutingTests(IsolatedMemory):
                 intent = {"action": action, "chat": "Test", "message": "payload"}
                 router._on_text_command.side_effect = lambda text: registry.run("whatsapp_web", intent)
                 router._route_text_command_v1("Operación contextual en WhatsApp")
-                self.assertEqual(handler.call_args.kwargs["parameters"], intent)
+                kw = handler.call_args.kwargs
+        self.assertEqual(kw.get("parameters") or kw.get("args"), intent)
 
     def test_pending_state_routes_all_input_with_operation_and_original_query(self):
         worker = self.worker()

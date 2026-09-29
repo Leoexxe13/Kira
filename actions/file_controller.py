@@ -415,6 +415,10 @@ def write_file(path: str, name: str = "", content: str = "", append: bool = Fals
 def find_files(name: str = "", extension: str = "",
                path: str = "home", max_results: int = 20) -> str:
     try:
+        # Normalize extension: accept "pdf" or ".pdf"
+        if extension and not extension.startswith("."):
+            extension = "." + extension
+
         search_path = _resolve_path(path)
         if not _is_safe_path(search_path):
             return f"Access denied: {search_path}"
@@ -686,7 +690,11 @@ def file_controller(
 # ── Tool declaration (auto-discovered by core/action_loader.py) ──────────────
 TOOL = {
     "name": "file_controller",
-    "description": "Manages files and folders: list, create, delete, move, copy, rename, read, write, find, disk usage.",
+    "description": (
+        "Manages files and folders with write capabilities: list, create, delete, move, copy, rename, read, write, find, disk usage. "
+        "For read-only structured exploration and search prefer local_explorer. "
+        "find supports extension with or without leading dot (e.g. 'pdf' or '.pdf')."
+    ),
     "parameters": {
         "type": "OBJECT",
         "properties": {
@@ -696,7 +704,7 @@ TOOL = {
             },
             "path": {
                 "type": "STRING",
-                "description": "File/folder path or shortcut: desktop, downloads, documents, home"
+                "description": "File/folder path or shortcut: desktop, downloads, documents, pictures, music, videos, home"
             },
             "destination": {
                 "type": "STRING",
@@ -712,15 +720,23 @@ TOOL = {
             },
             "name": {
                 "type": "STRING",
-                "description": "File name to search for"
+                "description": "File name or substring to search for (find action)"
             },
             "extension": {
                 "type": "STRING",
-                "description": "File extension to search (e.g. .pdf)"
+                "description": "File extension to search, with or without dot (e.g. 'pdf' or '.pdf')"
             },
             "count": {
                 "type": "INTEGER",
                 "description": "Number of results for largest"
+            },
+            "max_results": {
+                "type": "INTEGER",
+                "description": "Maximum results to return for find (default 20, max 50)"
+            },
+            "append": {
+                "type": "BOOLEAN",
+                "description": "For write: append to file instead of overwriting"
             }
         },
         "required": [

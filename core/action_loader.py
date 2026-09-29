@@ -99,14 +99,29 @@ class ActionRegistry:
 def _call_handler(fn: Callable, parameters: dict, ctx: dict) -> str:
     """Invoke the handler passing only the context kwargs it actually declares
     (or all of them if it has **kwargs), so each action's existing signature
-    works unchanged."""
+    works unchanged. Normalizes the first parameter (args/parameters)."""
     sig = inspect.signature(fn)
     has_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values())
     kwargs = {}
+    
+    # 1. Provide requested context keys
     for key in _CTX_KEYS:
         if has_var_kw or key in sig.parameters:
             kwargs[key] = ctx.get(key)
-    return fn(parameters=parameters, **kwargs)
+            
+    # 2. Some modern tools (like document_maker) expect a single 'context' dict
+    if "context" in sig.parameters and "context" not in kwargs:
+        kwargs["context"] = ctx
+
+    # 3. Inject the primary payload safely matching whatever name the first arg has
+    param_names = list(sig.parameters.keys())
+    if param_names:
+        first_param = param_names[0]
+        # Avoid overwriting if they weirdly named it 'context'
+        if first_param not in kwargs:
+            kwargs[first_param] = parameters
+            
+    return fn(**kwargs)
 
 
 def _validate(module, filename: str) -> ActionRecord:
